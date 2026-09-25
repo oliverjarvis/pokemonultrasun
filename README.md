@@ -15,8 +15,8 @@ remainder from generated assembly, then packs everything into a `.3ds` image tha
 | Component | State |
 |---|---|
 | `code.bin` (main executable, 4.95 MB of ARM code) | Builds byte-identical |
-| Decompiled to C++ | **7 / 25,981** functions |
-| CRO modules (132 relocatable modules, ~5.6 MB of code) | Rebuilt as data files; not yet disassembled |
+| Decompiled to C++ | **7 / 81,002** functions (all in `code.bin` so far) |
+| CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (55,021 functions) |
 | `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so code cannot grow yet |
 | RomFS, ExeFS, NCCH, NCSD containers | Rebuilt from files, byte-identical |
 
@@ -66,7 +66,8 @@ python3 tools/extract.py baserom.3ds      # code.bin, exheader, CRO modules    -
 python3 tools/unpack.py  baserom.3ds      # all container parts, RomFS files   -> orig/rom/
 python3 tools/symbols.py                  # names from static.crs              -> orig/symbols.tsv
 .venv/bin/python tools/analyze.py         # function and code/data discovery   -> orig/analysis.json
-.venv/bin/python tools/split.py           # one assembly file per function     -> asm/
+.venv/bin/python tools/split.py           # one assembly file per function     -> asm/text/
+.venv/bin/python tools/cro_split.py       # same for every CRO module          -> asm/cro/
 ```
 
 This is the only step that reads the dump. `orig/`, `asm/` and `build/` are generated locally and
@@ -76,8 +77,8 @@ ignored by git.
 
 ```sh
 .venv/bin/python tools/configure.py      # writes build.ninja; re-run after adding files to src/
-ninja                                    # -> build/code.bin, build/romfs.bin, build/rom.3ds
-.venv/bin/python tools/check.py          # verifies both hashes
+ninja                                    # -> build/code.bin, build/romfs_overlay/*.cro, build/rom.3ds
+.venv/bin/python tools/check.py          # verifies code.bin, every module and the ROM
 ```
 
 A successful build prints:
@@ -86,11 +87,12 @@ A successful build prints:
 original d05602171c1854f4c6d33c28589689f52f56c4cd
 built    d05602171c1854f4c6d33c28589689f52f56c4cd
 MATCH
+modules  133/133 identical
 rom.3ds  51957bc32b3e96bda2197496bf0b462dc3da0130  MATCH
 ```
 
-A clean `ninja` build takes about 22 seconds on a 15-core Mac, and a rebuild after a C++ change about 5
-seconds. The one-time `split.py` step adds about 45 seconds.
+A clean `ninja` build (about 81,000 assembly units) takes about 65 seconds on a 15-core Mac, and a
+rebuild after a C++ change about 5 seconds. The one-time split steps add about a minute.
 
 `build/rom.3ds` runs in emulators such as Azahar and on consoles running Luma3DS. Once the code
 differs from retail, the RSA signatures in the NCCH and NCSD headers no longer verify. Neither
@@ -125,12 +127,14 @@ Changes go through pull requests. `tools/check.py` must report `MATCH` for both 
 
 ```
 baserom.3ds ──extract/unpack──▶ orig/            (one time)
-orig/exefs/code.bin ──analyze/split──▶ asm/text/<ADDR>.s   25,981 function units
+orig/exefs/code.bin ──analyze/split──▶ asm/text/<ADDR>.s          25,981 function units
+orig/rom/romfs/*.cro ──cro_split────▶ asm/cro/<Module>/<OFF>.s   55,021 function units
 
 asm/text/*.s ──GNU as────▶ build/text/*.o ─┐
 src/**/*.cpp ──armcc 4.1─▶ build/src/*.o ──┼─ linkgen ─▶ ld.lld ─▶ build/code.bin
                                            │  (C++ replaces the asm unit at the same address)
-orig/rom/romfs/ ──ctr.py──▶ build/romfs.bin
+asm/cro/<Module>/*.s ──as/ld.lld/mkcro─▶ build/romfs_overlay/<Module>.cro, .crr/static.crr
+orig/rom/romfs/ + overlay ──ctr.py──▶ build/romfs.bin
 code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
 ```
 
@@ -141,6 +145,13 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
 - **Splitting** (`tools/split.py`) emits relocatable assembly: branches, literal pools and jump
   tables refer to symbols, and each unit lives in a `.text.<ADDR>` section so that a single
   `SORT_BY_NAME` rule places it at its original address.
+- **CRO modules** (`tools/cro.py`, `tools/cro_split.py`, `tools/mkcro.py`) are relocatable
+  modules loaded at runtime. All their relocations are `R_ARM_ABS32` and relocated words are zero
+  in the file, so the relocation tables say exactly which words are addresses. Calls into
+  `code.bin` go through import veneers (`ldr pc, [pc, #-4]`), which are named after the import:
+  `bl veneer__ZN3pml8pokepara9CoreParam7SetWazaEh6WazaNo`. Each module's `.text` is linked at its
+  file offset and spliced back into the module with its tables. `mkcro.py` then recomputes the
+  module's four SHA-256 hashes, and `static.crr` is regenerated from the built modules.
 - **Linking** (`tools/linkgen.py`) renames each armcc function section (`i.<symbol>`) to its
   unit's address. A compiled function must be exactly the size of the unit it replaces.
 - **Packaging** (`tools/ctr.py`, `tools/mkrom.py`) rebuilds the RomFS (including its IVFC hash
@@ -167,7 +178,8 @@ tools/         extraction, analysis, build and verification scripts
 |---|---|
 | `extract.py`, `unpack.py` | Extract code and every container part from a dump |
 | `inventory.py`, `symbols.py` | Code size report and CRO exports; `static.crs` symbol table |
-| `analyze.py`, `split.py` | Find functions and code/data; generate per-function assembly |
+| `analyze.py`, `split.py`, `asmemit.py` | Find functions and code/data; generate per-function assembly |
+| `cro.py`, `cro_split.py`, `mkcro.py` | CRO/CRR formats; split modules; rebuild modules with new code |
 | `configure.py`, `linkgen.py` | Generate `build.ninja`; place compiled C++ at unit addresses |
 | `ctr.py`, `mkrom.py`, `pad.py` | Build RomFS / ExeFS / NCCH / NCSD images |
 | `check.py`, `objcmp.py` | Verify hashes; compare a compiled object against the original |
@@ -175,7 +187,7 @@ tools/         extraction, analysis, build and verification scripts
 
 ## Roadmap
 
-- Disassemble and rebuild the 132 CRO modules (battle, overworld and most menus live there)
+- C++ in CRO modules: generate their relocation and import tables from compiled objects
 - Symbolize `.rodata` / `.data` so that modified code can change size
 - Grow C++ coverage, starting with the `pml` (Pokémon data and battle rules) and `item` libraries
 

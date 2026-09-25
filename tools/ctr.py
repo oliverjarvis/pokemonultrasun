@@ -15,7 +15,9 @@ byte-identical rebuilds):
          0xFF fill to the card capacity.
 
 CLI:
-  ctr.py romfs SRC_DIR OUT.bin     build a RomFS image from a directory
+  ctr.py romfs SRC_DIR OUT.bin [--overlay DIR]
+                                   build a RomFS image from a directory; files under
+                                   DIR replace those at the same relative path
 """
 import hashlib
 import os
@@ -130,9 +132,21 @@ def _block_hashes(data):
     return h.finish()
 
 
-def build_romfs(src_dir, out_path):
-    """Write a RomFS image for src_dir to out_path. Returns its size."""
+def build_romfs(src_dir, out_path, overlay=None):
+    """Write a RomFS image for src_dir to out_path. Returns its size.
+
+    Files that exist at the same relative path under `overlay` are taken from
+    there instead (built modules); the tree itself comes from src_dir."""
     top = _scan(src_dir)
+
+    def source(d, nm):
+        path = os.path.join(d.path, nm)
+        if overlay:
+            alt = os.path.join(overlay, os.path.relpath(path, src_dir))
+            if os.path.isfile(alt):
+                return alt
+        return path
+
     dirs = _dir_table_order(top)
 
     # directory metadata
@@ -146,7 +160,7 @@ def build_romfs(src_dir, out_path):
     off = 0
     for d in _preorder(top):
         for nm in d.files:
-            files.append([d, nm, off, None, os.path.getsize(os.path.join(d.path, nm))])
+            files.append([d, nm, off, None, os.path.getsize(source(d, nm))])
             off += 0x20 + align(len(nm.encode("utf-16-le")), 4)
     file_meta_size = off
 
@@ -225,7 +239,7 @@ def build_romfs(src_dir, out_path):
                 o.write(pad)
                 hasher.update(pad)
                 pos = doff
-            with open(os.path.join(d.path, nm), "rb") as fh:
+            with open(source(d, nm), "rb") as fh:
                 while True:
                     chunk = fh.read(1 << 22)
                     if not chunk:
@@ -306,8 +320,9 @@ def ncch_layout(header, exheader, logo, plain, exefs, romfs_size, romfs_hash_siz
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "romfs":
-        size = build_romfs(sys.argv[2], sys.argv[3])
+    if len(sys.argv) in (4, 6) and sys.argv[1] == "romfs":
+        overlay = sys.argv[5] if len(sys.argv) == 6 and sys.argv[4] == "--overlay" else None
+        size = build_romfs(sys.argv[2], sys.argv[3], overlay)
         print(f"romfs: {sys.argv[3]} {size:#x} bytes")
     else:
         sys.exit(__doc__)

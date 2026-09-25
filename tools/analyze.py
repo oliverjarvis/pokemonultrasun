@@ -127,7 +127,179 @@ def cmp_bound(t, a):
     return None
 
 
+CODE, LIT, JT = 1, 2, 3
+
+
+class Tracer:
+    """Recursive-traversal classifier for one ARM code region.
+
+    words: the region's 32-bit words; base: address of words[0];
+    thumb: word indices to leave alone; literals: addresses known to be data
+    (e.g. relocated words), marked before tracing.
+    """
+
+    def __init__(self, words, base, thumb=(), literals=()):
+        self.words, self.base = words, base
+        self.end = base + 4 * len(words)
+        self.kind = bytearray(len(words))
+        self.thumb = set(thumb)
+        self.funcs = {}
+        self.work = []
+        self.seen = set()
+        for a in literals:
+            if self.in_text(a):
+                self.kind[self.idx(a)] = LIT
+
+    def idx(self, a):
+        return (a - self.base) >> 2
+
+    def w(self, a):
+        return self.words[(a - self.base) >> 2]
+
+    def in_text(self, a):
+        return self.base <= a < self.end
+
+    def seed(self, a, name=None):
+        """Add a function start; returns True if it is new."""
+        if a in self.funcs:
+            if name and not self.funcs[a]:
+                self.funcs[a] = name
+            return False
+        self.funcs[a] = name
+        self.work.append(a)
+        return True
+
+    def trace(self, start):
+        kind = self.kind
+        stack = [start]
+        while stack:
+            a = stack.pop()
+            while True:
+                if not self.in_text(a) or a & 3:
+                    break
+                i = self.idx(a)
+                if kind[i] == CODE or i in self.thumb:
+                    break
+                if kind[i] in (LIT, JT):
+                    break
+                w = self.words[i]
+                kind[i] = CODE
+                for lt in pc_load_targets(w, a):
+                    if self.in_text(lt) and kind[self.idx(lt)] != CODE:
+                        kind[self.idx(lt)] = LIT
+                br = branch(w, a)
+                cond = w >> 28
+                if br:
+                    k, tgt = br
+                    if k == "bl" and self.in_text(tgt):
+                        self.seed(tgt)
+                    elif k == "b" and self.in_text(tgt):
+                        stack.append(tgt)
+                        if cond == AL:
+                            break
+                wp = writes_pc(w)
+                if wp == "jt_add":
+                    bound = cmp_bound(self, a)
+                    count = (bound + 1 if bound is not None else 0) + 1  # default branch + cases
+                    for k2 in range(1, count + 1):
+                        e = a + 4 * k2
+                        if self.in_text(e) and branch(self.w(e), e):
+                            stack.append(e)
+                    if cond == AL:
+                        break
+                elif wp == "jt_ldr":
+                    bound = cmp_bound(self, a)
+                    if bound is not None:
+                        # layout: ldrls pc,[pc,rX,lsl#2]; b default; .word case0..caseN
+                        stack.append(a + 4)
+                        for k2 in range(bound + 1):
+                            e = a + 8 + 4 * k2
+                            if self.in_text(e):
+                                kind[self.idx(e)] = JT
+                                tgt = self.w(e)
+                                if self.in_text(tgt):
+                                    stack.append(tgt)
+                    break
+                elif wp == "ret" and cond == AL:
+                    break
+                a += 4
+
+    def drain(self):
+        while self.work:
+            s = self.work.pop()
+            if s in self.seen:
+                continue
+            self.seen.add(s)
+            self.trace(s)
+
+    def looks_like_code(self, a):
+        if not self.in_text(a) or a & 3 or self.idx(a) in self.thumb or self.kind[self.idx(a)] in (LIT, JT):
+            return False
+        w = self.w(a)
+        return w >> 28 == AL and w != 0 and w != 0xFFFFFFFF
+
+    def pointer_seeds(self, values):
+        """Seed function starts from pointer values that land on untraced code."""
+        new = 0
+        for v in values:
+            if self.looks_like_code(v) and v not in self.funcs:
+                if self.kind[self.idx(v)] == CODE:
+                    continue  # points into middle of traced code: a label, not a function
+                self.seed(v)
+                new += 1
+        self.drain()
+        return new
+
+    def prologue_seeds(self):
+        """Seed LR-saving prologues that directly follow code or a literal pool."""
+        total = 0
+        for _ in range(3):
+            added = 0
+            for i in range(1, len(self.words)):
+                if self.kind[i] or i in self.thumb or self.kind[i - 1] not in (CODE, LIT):
+                    continue
+                w = self.words[i]
+                if w & 0xFFFF4000 == 0xE92D4000 or w == 0xE52DE004:
+                    if self.seed(self.base + 4 * i):
+                        added += 1
+            self.drain()
+            total += added
+            if not added:
+                break
+        return total
+
+    def runs(self, val):
+        out, s = [], None
+        n = len(self.words)
+        for i in range(n + 1):
+            on = i < n and self.kind[i] == val and i not in self.thumb
+            if on and s is None:
+                s = i
+            elif not on and s is not None:
+                out.append([self.base + 4 * s, self.base + 4 * i])
+                s = None
+        return out
+
+    def result(self):
+        n = len(self.words)
+        return {
+            "funcs": sorted([a, nm] for a, nm in self.funcs.items()),
+            "code": self.runs(CODE),
+            "literals": [self.base + 4 * i for i in range(n) if self.kind[i] == LIT],
+            "jumptabs": [self.base + 4 * i for i in range(n) if self.kind[i] == JT],
+        }
+
+    def summary(self):
+        n = len(self.words)
+        counts = {k: self.kind.count(k) for k in (0, CODE, LIT, JT)}
+        th = len(self.thumb)
+        return (f"words: {n}  code {counts[CODE] / n:.1%}  literal {counts[LIT] / n:.1%}  "
+                f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
+
+
 def analyze():
+    import bisect
+
     t = Text()
     syms = []
     for line in open(os.path.join(ROOT, "symbols.tsv")).read().splitlines()[1:]:
@@ -135,20 +307,9 @@ def analyze():
         if seg == "text":
             syms.append((int(addr, 16), mode, mangled))
     thumb_starts = sorted(a for a, m, _ in syms if m == "thumb")
-
-    n = t.size // 4
-    CODE, LIT, JT = 1, 2, 3
-    kind = bytearray(n)
-    func_starts = {a: name for a, m, name in syms if m == "arm"}
-    thumb = set()
-
-    def idx(a):
-        return (a - t.base) >> 2
+    arm_sorted = sorted(a for a, m, _ in syms if m == "arm")
 
     # Thumb regions: from each thumb symbol until the next ARM function symbol
-    arm_sorted = sorted(func_starts)
-    import bisect
-
     thumb_regions = []
     for s in thumb_starts:
         j = bisect.bisect_right(arm_sorted, s)
@@ -157,105 +318,21 @@ def analyze():
             thumb_regions[-1][1] = max(thumb_regions[-1][1], e)
         else:
             thumb_regions.append([s, e])
-    for s, e in thumb_regions:
-        for a in range(s, e, 4):
-            thumb.add(idx(a))
+    thumb = {(a - t.base) >> 2 for s, e in thumb_regions for a in range(s, e, 4)}
 
-    work = list(func_starts)
-    seen_start = set()
-
-    def trace(start):
-        """Trace one entry point; returns False if it hit an invalid spot."""
-        stack = [start]
-        while stack:
-            a = stack.pop()
-            while True:
-                if not t.in_text(a) or a & 3:
-                    break
-                i = idx(a)
-                if kind[i] == CODE or i in thumb:
-                    break
-                if kind[i] in (LIT, JT):
-                    break
-                w = t.w(a)
-                kind[i] = CODE
-                for lt in pc_load_targets(w, a):
-                    if t.in_text(lt) and kind[idx(lt)] != CODE:
-                        kind[idx(lt)] = LIT
-                br = branch(w, a)
-                cond = w >> 28
-                if br:
-                    k, tgt = br
-                    if k == "bl" and t.in_text(tgt):
-                        if tgt not in func_starts:
-                            func_starts[tgt] = None
-                            work.append(tgt)
-                    elif k == "b" and t.in_text(tgt):
-                        stack.append(tgt)
-                        if cond == AL:
-                            break
-                wp = writes_pc(w)
-                if wp == "jt_add":
-                    bound = cmp_bound(t, a)
-                    count = (bound + 1 if bound is not None else 0) + 1  # default branch + cases
-                    for k2 in range(1, count + 1):
-                        e = a + 4 * k2
-                        if t.in_text(e) and branch(t.w(e), e):
-                            stack.append(e)
-                    if cond == AL:
-                        break
-                elif wp == "jt_ldr":
-                    bound = cmp_bound(t, a)
-                    if bound is not None:
-                        # layout: ldrls pc,[pc,rX,lsl#2]; b default; .word case0..caseN
-                        stack.append(a + 4)
-                        for k2 in range(bound + 1):
-                            e = a + 8 + 4 * k2
-                            if t.in_text(e):
-                                kind[idx(e)] = JT
-                                tgt = t.w(e)
-                                if t.in_text(tgt):
-                                    stack.append(tgt)
-                    break
-                elif wp == "ret" and cond == AL:
-                    break
-                a += 4
-
-    def drain():
-        while work:
-            s = work.pop()
-            if s in seen_start:
-                continue
-            seen_start.add(s)
-            trace(s)
-
-    drain()
-    traced_seed = len(func_starts)
+    tr = Tracer(t.words, t.base, thumb)
+    for a, m, name in syms:
+        if m == "arm":
+            tr.seed(a, name)
+    named = len(tr.funcs)
+    tr.drain()
+    traced_seed = len(tr.funcs)
 
     # literal-pool / data pointers into text that look like code entry points
-    def looks_like_code(a):
-        if not t.in_text(a) or a & 3 or idx(a) in thumb or kind[idx(a)] in (LIT, JT):
-            return False
-        w = t.w(a)
-        return w >> 28 == AL and w != 0 and w != 0xFFFFFFFF
-
-    def pointer_seeds(words_iter):
-        new = 0
-        for v in words_iter:
-            if looks_like_code(v) and v not in func_starts:
-                if kind[idx(v)] == CODE:
-                    continue  # points into middle of traced code: a label, not a function
-                func_starts[v] = None
-                work.append(v)
-                new += 1
-        return new
-
-    lit_ptrs = pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if kind[idx(a)] == LIT)
-    drain()
+    lit_ptrs = tr.pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT)
     ro = t.blob[t.ro_off : t.ro_off + (t.ro[1] - t.ro[0]) // 4 * 4]
     da = t.blob[t.data_off : t.data_off + (t.data[1] - t.data[0]) // 4 * 4]
-    data_ptrs = pointer_seeds(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
-    drain()
+    data_ptrs = tr.pointer_seeds(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
 
     # .init_array: armcc emits static-constructor tables as place-relative
     # offsets. Find long runs of rodata words where (address + word) is code.
@@ -263,64 +340,21 @@ def analyze():
     rel_targets, run = [], []
     for k, v in enumerate(ro_words + (0,)):
         tgt = (t.ro[0] + 4 * k + v) & 0xFFFFFFFF
-        if k < len(ro_words) and looks_like_code(tgt):
+        if k < len(ro_words) and tr.looks_like_code(tgt):
             run.append(tgt)
             continue
         if len(run) >= 16:
             rel_targets.extend(run)
         run = []
-    init_ptrs = pointer_seeds(rel_targets)
-    drain()
+    init_ptrs = tr.pointer_seeds(rel_targets)
+    prologue_seeds = tr.prologue_seeds()
 
-    # prologues right after an unconditional return, in untraced space
-    prologue_seeds = 0
-    for rounds in range(3):
-        added = 0
-        for i in range(1, n):
-            if kind[i] or i in thumb or not kind[i - 1] in (CODE, LIT):
-                continue
-            w = t.words[i]
-            if w & 0xFFFF4000 == 0xE92D4000 or w == 0xE52DE004:
-                a = t.base + 4 * i
-                if a not in func_starts:
-                    func_starts[a] = None
-                    work.append(a)
-                    added += 1
-        drain()
-        prologue_seeds += added
-        if not added:
-            break
-
-    counts = {k: kind.count(k) for k in (0, CODE, LIT, JT)}
-    thumb_words = len(thumb)
-
-    def runs(val):
-        out, s = [], None
-        for i in range(n + 1):
-            on = i < n and kind[i] == val and i not in thumb
-            if on and s is None:
-                s = i
-            elif not on and s is not None:
-                out.append([t.base + 4 * s, t.base + 4 * i])
-                s = None
-        return out
-
-    result = {
-        "funcs": sorted([a, nm] for a, nm in func_starts.items()),
-        "code": runs(CODE),
-        "literals": [t.base + 4 * i for i in range(n) if kind[i] == LIT],
-        "jumptabs": [t.base + 4 * i for i in range(n) if kind[i] == JT],
-        "thumb": thumb_regions,
-    }
+    result = tr.result()
+    result["thumb"] = thumb_regions
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
-
-    named = sum(1 for _, nm in func_starts.items() if nm)
-    print(f"functions: {len(func_starts)} ({named} named; {traced_seed - named} from calls, "
+    print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues)")
-    tot = n
-    print(f"text words: {tot}  code {counts[CODE] / tot:.1%}  literal {counts[LIT] / tot:.1%}  "
-          f"jumptable {counts[JT] / tot:.1%}  thumb {thumb_words / tot:.1%}  "
-          f"unknown {(counts[0] - thumb_words) / tot:.1%}")
+    print("text " + tr.summary())
 
 
 if __name__ == "__main__":
