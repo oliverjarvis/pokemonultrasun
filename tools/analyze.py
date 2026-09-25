@@ -42,6 +42,7 @@ class Text:
         self.data = (ex["data"]["addr"], ex["data"]["addr"] + ex["data"]["size"])
         self.ro_off = ex["rodata"]["addr"] - self.base
         self.data_off = ex["data"]["addr"] - self.base
+        self.bss_end = self.data[1] + ex["bss_size"]
 
     def w(self, a):
         return self.words[(a - self.base) >> 2]
@@ -110,6 +111,22 @@ def writes_pc(w):
         if op == 4 and (w >> 16) & 0xF == 15 and not (w >> 25) & 1:  # add pc, pc, rX, lsl #2
             return "jt_add"
         return "ret"
+    return None
+
+
+def sext(v, bits):
+    return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+
+def thumb_call(h1, h2, a):
+    """Decode a Thumb-1 BL/BLX pair at a: ("bl"|"blx", target) or None."""
+    if h1 & 0xF800 != 0xF000:
+        return None
+    off = sext(((h1 & 0x7FF) << 12) | ((h2 & 0x7FF) << 1), 23)
+    if h2 & 0xF800 == 0xF800:
+        return ("bl", a + 4 + off)
+    if h2 & 0xF800 == 0xE800:
+        return ("blx", (a + 4 + off) & ~3)
     return None
 
 
@@ -297,6 +314,61 @@ class Tracer:
                 f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
 
 
+def carve_arm_from_thumb(t, tr, regions):
+    """ARM code inside the Thumb library regions (ARM-state entry stubs such as
+    `add ip, pc, #1; bx ip`, small ARM helpers): every ARM b/bl target and
+    Thumb BLX target that lands in a Thumb region is ARM code. Trace each one
+    as ARM (the words it reaches stop being Thumb) and repeat until stable."""
+    carved = 0
+    while True:
+        entries = set()
+        for i, k in enumerate(tr.kind):
+            if k != CODE:
+                continue
+            a = t.base + 4 * i
+            br = branch(t.words[i], a)
+            if br and br[0] != "blx" and tr.idx(br[1]) in tr.thumb:
+                entries.add(br[1])
+        for s, e in regions:
+            for a in range(s, e - 2, 2):
+                if tr.idx(a) not in tr.thumb:
+                    continue
+                h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
+                c = thumb_call(h1, h2, a)
+                if c and c[0] == "blx" and tr.in_text(c[1]) and tr.idx(c[1]) in tr.thumb:
+                    entries.add(c[1])
+        if not entries:
+            return carved
+        for a in sorted(entries):
+            # linear ARM walk to find the words this entry covers
+            p = a
+            while tr.in_text(p) and tr.idx(p) in tr.thumb:
+                w = tr.w(p)
+                tr.thumb.discard(tr.idx(p))
+                for lt in pc_load_targets(w, p):
+                    tr.thumb.discard(tr.idx(lt))
+                if (writes_pc(w) == "ret" or (branch(w, p) and branch(w, p)[0] == "b")) and w >> 28 == AL:
+                    break
+                p += 4
+            tr.seed(a)
+            tr.seen.discard(a)  # it may have been reached before (and stopped at the Thumb boundary)
+            tr.work.append(a)
+            carved += 1
+        tr.drain()
+
+
+def thumb_runs(tr):
+    """Contiguous [start, end) runs of the remaining Thumb words."""
+    out = []
+    for i in sorted(tr.thumb):
+        a = tr.base + 4 * i
+        if out and out[-1][1] == a:
+            out[-1][1] = a + 4
+        else:
+            out.append([a, a + 4])
+    return out
+
+
 def analyze():
     import bisect
 
@@ -326,6 +398,7 @@ def analyze():
             tr.seed(a, name)
     named = len(tr.funcs)
     tr.drain()
+    carved = carve_arm_from_thumb(t, tr, thumb_regions)
     traced_seed = len(tr.funcs)
 
     # literal-pool / data pointers into text that look like code entry points
@@ -348,10 +421,12 @@ def analyze():
         run = []
     init_ptrs = tr.pointer_seeds(rel_targets)
     prologue_seeds = tr.prologue_seeds()
+    carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
 
     result = tr.result()
-    result["thumb"] = thumb_regions
+    result["thumb"] = thumb_runs(tr)
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
+    print(f"carved {carved} ARM entry points out of Thumb regions")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues)")
     print("text " + tr.summary())

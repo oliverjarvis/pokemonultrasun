@@ -19,6 +19,7 @@ import os
 
 from analyze import CODE, JT, LIT, Text
 from asmemit import MACROS, Region
+from pointers import looks_like_pointer
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 ORIG = os.path.join(ROOT, "orig")
@@ -49,20 +50,26 @@ def main():
         kind[(a - t.base) >> 2] = JT
 
     data_syms = set()
+    thumb = an["thumb"]
+    in_thumb = lambda a: any(ts <= a < te for ts, te in thumb)
 
     def word_ref(a, w):
         """Pointer-like literal values become symbols (text labels or data_ADDR)."""
+        if not looks_like_pointer(w, t):
+            return None
         if t.in_text(w):
             tgt = w & ~1
-            return ("text", tgt, " + 1" if w & 1 else "") if tgt % 4 == 0 else None
-        if t.ro[0] <= w < t.data[1] + 0x40000:  # rodata, data, bss (generous upper bound)
-            data_syms.add(w)
-            return ("expr", f"data_{w:08X}")
-        return None
+            if w & 1 and in_thumb(tgt):
+                return ("text", tgt, "")  # Thumb function pointer; the label carries bit 0
+            return ("text", tgt, " + 1" if w & 1 else "") if tgt % 4 == 0 and not in_thumb(tgt) else None
+        data_syms.add(w)
+        return ("expr", f"data_{w:08X}")
 
     region = Region(t.words, t.base, t.blob[: t.size], kind, [a for a, _ in an["funcs"]],
-                    names, force_raw, word_ref)
+                    names, force_raw, word_ref, thumb=thumb)
     units = region.emit(os.path.join(ROOT, "asm", "text"))
+    print(f"merged {getattr(region, 'merged', 0)} function starts into shared-literal-pool units, "
+          f"{len(region.thumb_labels)} Thumb labels")
 
     # ---- data sections, macros, linker script, ninja
     os.makedirs(os.path.join(ROOT, "build"), exist_ok=True)

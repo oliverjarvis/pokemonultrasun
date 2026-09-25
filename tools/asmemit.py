@@ -10,31 +10,52 @@ caller's `word_ref(addr, word)` callback, which returns one of:
   ("expr", text)           an arbitrary assembler expression
   ("raw", comment)         keep the raw value, with a trailing comment
 `labels` are addresses that need a global label (referenced from elsewhere).
+
+Units that load literals from each other (code built without per-function
+sections shares literal pools) are merged, so every pc-relative load stays
+inside its unit; the merged function starts keep their names as global
+labels. `thumb` regions ([start, end) of Thumb code) become their own units:
+raw halfwords, except BL/BLX calls and literal-pool pointers, which are
+symbolic, and Thumb function labels at every entry point used elsewhere.
+ARM `blx` calls into them are symbolic too.
 """
 import bisect
 import os
 import re
 import shutil
+import struct
 
 import capstone
 
-from analyze import CODE, JT, LIT, branch, pc_load_targets
+from analyze import CODE, JT, LIT, branch, pc_load_targets, thumb_call
 
 PC_REL = re.compile(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]")
 
 
 class Region:
-    def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None, labels=()):
+    def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None, labels=(),
+                 thumb=()):
         self.words, self.base, self.blob, self.kind = words, base, blob, kind
         self.extra_labels = set(labels)  # addresses referenced from outside the region
         self.end = base + 4 * len(words)
-        self.starts = sorted(set(starts) | {base})
-        self.names = names or {}
+        self.thumb = sorted((s, e) for s, e in thumb)
+        self.names = dict(names or {})
         self.force_raw = set(force_raw)
         self.word_ref = word_ref or (lambda a, w: None)
+        starts = set(starts) | {base}
+        for s, e in self.thumb:
+            starts -= {a for a in starts if s < a < e}
+            starts |= {s} | ({e} if e < self.end else set())
+        self.starts = sorted(starts)
+        self._merge_shared_pools()
 
+    # ---- helpers
     def in_text(self, a):
         return self.base <= a < self.end
+
+    def in_thumb(self, a):
+        i = bisect.bisect_right(self.thumb, (a, 1 << 40)) - 1
+        return i >= 0 and self.thumb[i][0] <= a < self.thumb[i][1]
 
     def unit_of(self, a):
         return bisect.bisect_right(self.starts, a) - 1
@@ -42,11 +63,55 @@ class Region:
     def unit_sym(self, a):
         return self.names.get(a) or f"sub_{a:08X}"
 
-    def _labels(self):
-        local, glob = set(), set()
+    def thumb_sym(self, a):
+        return self.names.get(a) or f"thumb_{a:08X}"
 
-        def ref(src, tgt):
-            if tgt in self.starts:
+    def w(self, a):
+        return self.words[(a - self.base) >> 2]
+
+    def hw(self, a):
+        return struct.unpack_from("<H", self.blob, a - self.base)[0]
+
+    def _merge_shared_pools(self):
+        """Merge runs of units linked by pc-relative loads across unit boundaries."""
+        spans = []
+        for i, w in enumerate(self.words):
+            a = self.base + 4 * i
+            if self.kind[i] != CODE or a in self.force_raw or self.in_thumb(a):
+                continue
+            for lt in pc_load_targets(w, a):
+                if self.in_text(lt) and not self.in_thumb(lt):
+                    us, ut = self.unit_of(a), self.unit_of(lt & ~3)
+                    if us != ut:
+                        spans.append((min(us, ut), max(us, ut)))
+        if not spans:
+            return
+        drop = set()
+        spans.sort()
+        cur_s, cur_e = spans[0]
+        for s, e in spans[1:] + [(1 << 40, 1 << 40)]:
+            if s <= cur_e:
+                cur_e = max(cur_e, e)
+                continue
+            for u in range(cur_s + 1, cur_e + 1):
+                drop.add(self.starts[u])
+            cur_s, cur_e = s, e
+        for a in drop:
+            self.names.setdefault(a, f"sub_{a:08X}")  # keep the name as an inner global label
+        self.merged = len(drop)
+        self.starts = [a for a in self.starts if a not in drop]
+
+    # ---- labels
+    def _labels(self):
+        local, glob, thumb_labels = set(), set(), set()
+
+        def ref(src, tgt, arm=False):
+            if self.in_thumb(tgt):
+                if arm:
+                    raise ValueError(f"ARM-state reference from {src:#x} into Thumb code at {tgt:#x}")
+                thumb_labels.add(tgt)
+                return
+            if tgt in self.starts or tgt in self.names:
                 return
             (local if self.unit_of(src) == self.unit_of(tgt) else glob).add(tgt)
 
@@ -54,11 +119,13 @@ class Region:
             a = self.base + 4 * i
             if a in self.force_raw:
                 continue
+            if self.in_thumb(a):
+                continue
             k = self.kind[i]
             if k == CODE:
                 br = branch(w, a)
-                if br and br[0] != "blx" and self.in_text(br[1]):
-                    ref(a, br[1])
+                if br and self.in_text(br[1] & ~1):
+                    ref(a, br[1] & ~1, arm=br[0] != "blx")
                 for lt in pc_load_targets(w, a):
                     if self.in_text(lt):
                         ref(a, lt & ~3)
@@ -66,17 +133,45 @@ class Region:
                 r = self.word_ref(a, w)
                 if r and r[0] == "text":
                     ref(a, r[1])
-        glob |= {a for a in self.extra_labels if a not in self.starts and self.in_text(a)}
+        for s, e in self.thumb:
+            for a in range(s, e - 2, 2):
+                c = thumb_call(self.hw(a), self.hw(a + 2), a)
+                if c and self.in_text(c[1]):
+                    ref(a, c[1], arm=c[0] == "blx")
+            for a in self._thumb_literals(s, e):
+                r = self.word_ref(a, self.w(a))
+                if r and r[0] == "text":
+                    ref(a, r[1])
+            thumb_labels |= {a for a in self.names if s <= a < e}
+        glob |= {a for a in self.extra_labels if a not in self.starts and self.in_text(a) and not self.in_thumb(a)}
+        thumb_labels |= {a for a in self.extra_labels if self.in_thumb(a)}
         local -= glob
-        return local, glob
+        return local, glob, thumb_labels
 
+    def _thumb_literals(self, s, e):
+        """Addresses of literal-pool words used by Thumb `ldr rX, [pc, #imm]` in [s, e)."""
+        out = set()
+        for a in range(s, e, 2):
+            h = self.hw(a)
+            if h & 0xF800 == 0x4800:
+                t = ((a + 4) & ~3) + (h & 0xFF) * 4
+                if s <= t < e:
+                    out.add(t)
+        return out
+
+    # ---- emission
     def emit(self, out_dir, include="macros.inc"):
         """Write <out_dir>/<ADDR>.s per unit; returns [(addr, size, symbol)]."""
-        local, glob = self._labels()
+        local, glob, thumb_labels = self._labels()
+        self.thumb_labels = thumb_labels
 
         def sym_for(tgt):
+            if self.in_thumb(tgt):
+                return self.thumb_sym(tgt)
             if tgt in self.starts:
                 return self.unit_sym(tgt)
+            if tgt in self.names:
+                return self.names[tgt]
             if tgt in glob:
                 return f"loc_{tgt:08X}"
             return f".L_{tgt:08X}"
@@ -88,70 +183,105 @@ class Region:
         units = []
         for ui, s in enumerate(self.starts):
             e = self.starts[ui + 1] if ui + 1 < len(self.starts) else self.end
-            blob = self.blob[s - self.base : e - self.base]
-            dis = {}
-            off = 0
-            while off < len(blob):
-                last = off
-                for addr, size, mnem, op in md.disasm_lite(blob[off:], s + off):
-                    dis[addr] = (mnem, op)
-                    off = addr - s + size
-                if off == last:  # undecodable word: capstone stops, skip it
-                    off += 4
-            sym = self.unit_sym(s)
-            lines = [f".include \"{include}\"", f".section .text.{s:08X}, \"ax\", %progbits", "", f"glabel {sym}"]
-            for a in range(s, e, 4):
-                i = (a - self.base) >> 2
-                if a != s and a in self.names:
-                    lines.append(f"glabel {self.names[a]}")
-                if a in glob:
-                    lines.append(f"glabel loc_{a:08X}")
-                elif a in local:
-                    lines.append(f".L_{a:08X}:")
-                w = self.words[i]
-                k = self.kind[i]
-                if a in self.force_raw:
-                    lines.append(f"    .inst 0x{w:08x} /* {a:08X} */")
-                    continue
-                if k == CODE and a in dis:
-                    mnem, op = dis[a]
-                    br = branch(w, a)
-                    if br:
-                        if br[0] == "blx" or not self.in_text(br[1]):
-                            lines.append(f"    .inst 0x{w:08x} /* {a:08X} {mnem} */")
-                            continue
-                        op = sym_for(br[1])
-                    else:
-                        m = PC_REL.search(op)
-                        if m and pc_load_targets(w, a):
-                            tgt = a + 8 + int(m.group(1), 0)
-                            base_w = tgt & ~3
-                            if not self.in_text(base_w) or self.unit_of(base_w) != ui:
-                                # pc-relative load across units: keep exact bytes
-                                lines.append(f"    .inst 0x{w:08x} /* {a:08X} {mnem} {op} */")
-                                continue
-                            expr = sym_for(base_w) + (f" + {tgt - base_w}" if tgt != base_w else "")
-                            op = op[: m.start()] + expr + op[m.end() :]
-                    lines.append(f"    {mnem} {op} /* {a:08X} */".replace("  /*", " /*"))
-                    continue
-                if k in (LIT, JT):
-                    r = self.word_ref(a, w)
-                    if r:
-                        if r[0] == "text":
-                            lines.append(f"    .word {sym_for(r[1])}{r[2]} /* {a:08X} */")
-                            continue
-                        if r[0] == "expr":
-                            lines.append(f"    .word {r[1]} /* {a:08X} */")
-                            continue
-                        if r[0] == "raw":
-                            lines.append(f"    .word 0x{w:08x} /* {a:08X} {r[1]} */")
-                            continue
-                lines.append(f"    .word 0x{w:08x} /* {a:08X} */")
-            lines.append(f"endlabel {sym}")
+            if self.in_thumb(s):
+                lines, sym = self._emit_thumb(s, e, sym_for, include)
+            else:
+                lines, sym = self._emit_arm(ui, s, e, md, sym_for, local, glob, include)
             with open(os.path.join(out_dir, f"{s:08X}.s"), "w") as f:
                 f.write("\n".join(lines) + "\n")
             units.append((s, e - s, sym))
         return units
+
+    def _data_word(self, a, w, sym_for):
+        r = self.word_ref(a, w)
+        if r:
+            if r[0] == "text":
+                if self.in_thumb(r[1]):
+                    return f"    .word {self.thumb_sym(r[1])} /* {a:08X} */"  # Thumb symbols carry bit 0
+                return f"    .word {sym_for(r[1])}{r[2]} /* {a:08X} */"
+            if r[0] == "expr":
+                return f"    .word {r[1]} /* {a:08X} */"
+            if r[0] == "raw":
+                return f"    .word 0x{w:08x} /* {a:08X} {r[1]} */"
+        return f"    .word 0x{w:08x} /* {a:08X} */"
+
+    def _emit_arm(self, ui, s, e, md, sym_for, local, glob, include):
+        blob = self.blob[s - self.base : e - self.base]
+        dis = {}
+        off = 0
+        while off < len(blob):
+            last = off
+            for addr, size, mnem, op in md.disasm_lite(blob[off:], s + off):
+                dis[addr] = (mnem, op)
+                off = addr - s + size
+            if off == last:  # undecodable word: capstone stops, skip it
+                off += 4
+        sym = self.unit_sym(s)
+        lines = [f".include \"{include}\"", f".section .text.{s:08X}, \"ax\", %progbits", "", f"glabel {sym}"]
+        for a in range(s, e, 4):
+            i = (a - self.base) >> 2
+            if a != s and a in self.names:
+                lines.append(f"glabel {self.names[a]}")
+            if a in glob:
+                lines.append(f"glabel loc_{a:08X}")
+            elif a in local:
+                lines.append(f".L_{a:08X}:")
+            w = self.words[i]
+            k = self.kind[i]
+            if a in self.force_raw:
+                lines.append(f"    .inst 0x{w:08x} /* {a:08X} */")
+                continue
+            if k == CODE and a in dis:
+                mnem, op = dis[a]
+                br = branch(w, a)
+                if br:
+                    tgt = br[1] & ~1
+                    if not self.in_text(tgt) or (br[0] == "blx" and not self.in_thumb(tgt)):
+                        lines.append(f"    .inst 0x{w:08x} /* {a:08X} {mnem} */")
+                        continue
+                    op = sym_for(tgt)
+                else:
+                    m = PC_REL.search(op)
+                    if m and pc_load_targets(w, a):
+                        tgt = a + 8 + int(m.group(1), 0)
+                        base_w = tgt & ~3
+                        if not self.in_text(base_w) or self.unit_of(base_w) != ui:
+                            lines.append(f"    .inst 0x{w:08x} /* {a:08X} {mnem} {op} */")
+                            continue
+                        expr = sym_for(base_w) + (f" + {tgt - base_w}" if tgt != base_w else "")
+                        op = op[: m.start()] + expr + op[m.end() :]
+                lines.append(f"    {mnem} {op} /* {a:08X} */".replace("  /*", " /*"))
+                continue
+            if k in (LIT, JT):
+                lines.append(self._data_word(a, w, sym_for))
+                continue
+            lines.append(f"    .word 0x{w:08x} /* {a:08X} */")
+        lines.append(f"endlabel {sym}")
+        return lines, sym
+
+    def _emit_thumb(self, s, e, sym_for, include):
+        sym = self.thumb_sym(s)
+        literals = self._thumb_literals(s, e)
+        lines = [f".include \"{include}\"", f".section .text.{s:08X}, \"ax\", %progbits", ".thumb", ""]
+        a = s
+        while a < e:
+            if a in self.thumb_labels or a == s:
+                name = self.thumb_sym(a)
+                lines += [f"    .global {name}", "    .thumb_func", f"{name}:"]
+            if a in literals and a % 4 == 0 and a + 4 <= e:
+                lines.append(self._data_word(a, self.w(a), sym_for))
+                a += 4
+                continue
+            if a + 4 <= e and not (a + 2 in self.thumb_labels):
+                c = thumb_call(self.hw(a), self.hw(a + 2), a)
+                if c and self.in_text(c[1]) and (c[0] == "blx") == (not self.in_thumb(c[1])):
+                    lines.append(f"    {c[0]} {sym_for(c[1])} /* {a:08X} */")
+                    a += 4
+                    continue
+            lines.append(f"    .hword 0x{self.hw(a):04x} /* {a:08X} */")
+            a += 2
+        lines += [".arm", f"    .size {sym}, . - {sym}"]
+        return lines, sym
 
 
 MACROS = (".syntax unified\n.arm\n.text\n"
