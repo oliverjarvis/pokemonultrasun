@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Verify build/code.bin against the original and learn raw-word fallbacks.
+"""Verify build/code.bin, the CRO modules and build/rom.3ds against the originals.
+
+Also learns raw-word fallbacks for code.bin.
 
   check.py [--learn]
 
@@ -32,6 +34,22 @@ def assembler_errors():
         if a:
             out[int(a.group(1), 16)] = "as: " + msg.split(" -- ")[0]
     return out
+
+
+def check_modules():
+    """Compare built CRO modules and static.crr with the originals. None if not built."""
+    built_dir = os.path.join(ROOT, "build", "romfs_overlay")
+    if not os.path.isdir(built_dir):
+        return None
+    orig_dir = os.path.join(ROOT, "orig", "rom", "romfs")
+    paths = sorted(f for f in os.listdir(built_dir) if f.endswith(".cro")) + [os.path.join(".crr", "static.crr")]
+    bad = []
+    for rel in paths:
+        a, b = os.path.join(built_dir, rel), os.path.join(orig_dir, rel)
+        if os.path.exists(a) and open(a, "rb").read() != open(b, "rb").read():
+            bad.append(rel)
+    print(f"modules  {len(paths) - len(bad)}/{len(paths)} identical" + (f"; differ: {', '.join(bad[:8])}" if bad else ""))
+    return not bad
 
 
 def check_rom():
@@ -92,8 +110,9 @@ def main():
             for a in sorted(new):
                 f.write(f"{a:08X}  {new[a]}\n")
         print(f"learned {len(new)} raw words -> config/force_raw.txt")
+    mods_ok = check_modules()
     rom_ok = check_rom()
-    return 0 if ok and rom_ok is not False else 1
+    return 0 if ok and mods_ok is not False and rom_ok is not False else 1
 
 
 if __name__ == "__main__":
