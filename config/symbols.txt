@@ -1,0 +1,12 @@
+# Addresses for symbols referenced from src/ that are not defined in C++ yet.
+# Format: linker-script assignments, one per line.
+
+# functions
+_ZN3pml6battle12TypeAffinity12CalcAffinityEhhhb = 0x0031C284;
+tinymt32_init = 0x0014A428;
+sfmt_gen_rand_all = 0x0055EA4C;
+
+# data
+_ZN4item9NutsTableE = 0x005BB70E;
+_ZN4item10JewelTableE = 0x005BB86A;
+_ZN4item10BeadsTableE = 0x005BB932;

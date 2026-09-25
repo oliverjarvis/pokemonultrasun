@@ -1,0 +1,15 @@
+# ROM and everything derived from it
+*.3ds
+*.cia
+orig/
+asm/
+build/
+build.ninja
+.ninja_*
+# local tooling
+.venv/
+__pycache__/
+.DS_Store
+# proprietary compiler / third-party runner (user-supplied)
+tools/armcc/
+tools/wibo/
