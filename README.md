@@ -164,7 +164,11 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
   and `--emit-relocs`, then `crolink.py` writes the module from scratch. It lays out the segments,
   turns every absolute relocation into a CRO internal or import relocation (zeroing the word),
   regenerates the segment, export and import tables and the header, and recomputes the four
-  SHA-256 hashes. `static.crr` is regenerated from the built modules. Entries follow the original
+  SHA-256 hashes. `static.crr` is regenerated from the built modules.
+- **Cross-module references**: modules also import from each other by raw offset (1,236 such
+  references, plus 536 from `static.crs` into modules). Every such target gets a label in the target
+  module (`incoming.json`), and `crolink.py` / `crslink.py` re-resolve the offset from the target's
+  linked ELF, so references stay correct when the target module changes size. Entries follow the original
   order (recorded per relocation as unit + offset), so unchanged modules come out byte-identical,
   and modules whose code grew get correct new tables.
 - **Linking** (`tools/linkgen.py`) renames each armcc function section (`i.<symbol>`) to its
@@ -194,7 +198,7 @@ tools/         extraction, analysis, build and verification scripts
 | `extract.py`, `unpack.py` | Extract code and every container part from a dump |
 | `inventory.py`, `symbols.py` | Code size report and CRO exports; `static.crs` symbol table |
 | `analyze.py`, `split.py`, `asmemit.py` | Find functions and code/data; generate per-function assembly |
-| `cro.py`, `cro_split.py`, `crolink.py` | CRO/CRR formats; split modules into relinkable asm; module linker |
+| `cro.py`, `cro_split.py`, `crolink.py`, `crslink.py` | CRO/CRR formats; split modules into relinkable asm; module linker; `static.crs` rebuild |
 | `configure.py`, `linkgen.py` | Generate `build.ninja`; place compiled C++ at unit addresses |
 | `ctr.py`, `mkrom.py`, `pad.py` | Build RomFS / ExeFS / NCCH / NCSD images |
 | `check.py`, `objcmp.py` | Verify hashes; compare a compiled object against the original |

@@ -13,6 +13,8 @@ For each orig/rom/romfs/<Module>.cro:
   build/cro/<Module>/layout.ld   linker script: each segment at its own base (SEG_BASE)
   build/cro/<Module>/symbols.ld  link addresses for imports (veneer, or a unique fake)
   build/cro/<Module>/meta.json   what crolink.py needs to write the module back
+  build/cro/<Module>/incoming.json  original segment tag -> symbol, for every place
+                                 another module (or static.crs) imports anonymously
 
 config/cro/<Module>.txt names functions and data: `<symbol> <segment> <offset>`.
 
@@ -138,6 +140,24 @@ def read_imports(c, static_syms):
     return imports, modules, words, chains
 
 
+def incoming_references():
+    """Module name -> set of segment tags that other modules (and static.crs)
+    import anonymously, i.e. by raw offset. These need stable labels."""
+    out = {}
+    files = [f for f in os.listdir(ROMFS) if f.endswith(".cro")] + ["static.crs"]
+    for f in files:
+        c = Cro(open(os.path.join(ROMFS, f), "rb").read(), f)
+        ao, _ = c.tables["anon_imports"]
+        anon = c.table("anon_imports")
+        for e in c.table("import_modules"):
+            name_off, ihead, inum, ahead, anum = struct.unpack("<5I", e)
+            target = cstr(c.data, name_off)
+            first = (ahead - ao) // 8
+            for k in range(first, first + anum):
+                out.setdefault(target, set()).add(struct.unpack("<II", anon[k])[0])
+    return out
+
+
 def data_alignment(c):
     io, n = c.tables["internal_relocs"]
     if c.hdr["data_off"] == io + 12 * n:
@@ -174,7 +194,7 @@ def emit_segment(path, kind, module_file, file_off, size, labels, words):
         f.write("\n".join(lines) + "\n")
 
 
-def split_module(path, static_syms):
+def split_module(path, static_syms, incoming=()):
     name = os.path.splitext(os.path.basename(path))[0]
     c = Cro(open(path, "rb").read(), name)
     segs = segments_by_kind(c)
@@ -224,6 +244,8 @@ def split_module(path, static_syms):
             add(c.seg_addr(tag), None)
     tr.drain()
     tr.pointer_seeds(toff + to for sk, so, tk, to in internal if tk == "text")
+    incoming_text = {c.seg_addr(tag) for tag in incoming if seg_kind[tag & 0xF] == "text"}
+    tr.pointer_seeds(sorted(incoming_text))
     tr.prologue_seeds()
 
     # every .text target referenced from a relocation needs a global label
@@ -234,6 +256,10 @@ def split_module(path, static_syms):
                 sys.exit(f"{name}: relocation target text+{to:#x} is outside .text")
             if to < tsize:
                 text_targets.add(toff + (to & ~3))
+    for a in incoming_text:
+        if a % 4:
+            sys.exit(f"{name}: another module imports unaligned text address {a:#x}")
+        text_targets.add(a)
 
     def word_ref(a, w):
         if a in import_words:
@@ -281,6 +307,7 @@ def split_module(path, static_syms):
     for sym, seg, off in config:
         if seg != "text":
             labels[seg].setdefault(off, []).append(sym)
+    incoming_syms = {f"{tag:#x}": tag_symbol(tag) for tag in sorted(incoming)}
     exports = [[sym, tag_symbol(tag)] for sym, tag in c.named_exports()]
     hook_syms = {f: (tag_symbol(c.hdr[f]) if c.hdr[f] != 0xFFFFFFFF else None) for f in hooks}
     module_file = os.path.relpath(path, ROOT)
@@ -331,6 +358,8 @@ def split_module(path, static_syms):
     os.makedirs(bdir, exist_ok=True)
     with open(os.path.join(bdir, "meta.json"), "w") as f:
         json.dump(meta, f)
+    with open(os.path.join(bdir, "incoming.json"), "w") as f:
+        json.dump(incoming_syms, f)
     with open(os.path.join(bdir, "units.tsv"), "w") as f:
         f.write("addr\tsize\tsymbol\n")
         for s, size, sym in units:
@@ -364,13 +393,14 @@ def main():
     with open(os.path.join(ROOT, "asm", "macros.inc"), "w") as f:
         f.write(MACROS)
     wanted = set(sys.argv[1:])
+    incoming = incoming_references()
     total_units = code = lit = unk = words = 0
     paths = sorted(p for p in os.listdir(ROMFS) if p.endswith(".cro"))
     done = 0
     for p in paths:
         if wanted and os.path.splitext(p)[0] not in wanted:
             continue
-        _, nunits, tr = split_module(os.path.join(ROMFS, p), names)
+        _, nunits, tr = split_module(os.path.join(ROMFS, p), names, incoming.get(os.path.splitext(p)[0], set()))
         done += 1
         total_units += nunits
         if tr:

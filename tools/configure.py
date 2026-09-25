@@ -11,13 +11,30 @@ Build graph:
   code.bin + romfs.bin + orig/rom parts --mkrom--> build/rom.3ds
 """
 import glob
+import json
 import os
+import struct
+import sys
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 ARMCC_DIR = "tools/armcc/4.1/b1454"
 
 CFLAGS = (f"-c --cpu=MPCore --fpmode=fast --apcs=/interwork -I {ARMCC_DIR}/include -I include "
           "-O3 -Otime --cpp --arm --split_sections")
+
+
+def target_deps(mod):
+    """Link outputs of the modules `mod` imports from anonymously."""
+    meta = json.load(open(f"build/cro/{mod}/meta.json"))
+    return [f"build/cro/{m['name']}/{f}" for m in meta["import_modules"] if m["anon_count"]
+            for f in ("module.elf", "incoming.json")]
+
+
+def static_targets():
+    sys.path.insert(0, "tools")
+    from cro import Cro, cstr
+    c = Cro(open("orig/rom/romfs/static.crs", "rb").read(), "static.crs")
+    return [cstr(c.data, struct.unpack("<5I", e)[0]) for e in c.table("import_modules")]
 
 
 def main():
@@ -57,6 +74,9 @@ def main():
         "rule crolink",
         "  command = $PYTHON tools/crolink.py $orig $in $meta $out",
         "  description = CROLINK $out",
+        "rule crslink",
+        "  command = $PYTHON tools/crslink.py $in $out",
+        "  description = CRSLINK $out",
         "rule crr",
         "  command = $PYTHON tools/cro.py crr $orig $out $in",
         "  description = CRR $out",
@@ -81,6 +101,7 @@ def main():
         src_objs.append(o)
     # CRO modules: assemble, link .text at its file offset, splice into the module
     overlay_cros = []
+    overlay_mods = []
     module_sources = 0
     for mod in sorted(os.listdir("build/cro")) if os.path.isdir("build/cro") else []:
         units_tsv = f"build/cro/{mod}/units.tsv"
@@ -107,6 +128,7 @@ def main():
             nj.append(f"build {o}: as asm/cro/{mod}/{kind}.s | asm/macros.inc orig/rom/romfs/{mod}.cro")
             seg_objs.append(o)
         out = f"build/romfs_overlay/{mod}.cro"
+        overlay_mods.append(mod)
         nj += [
             f"build {d}/link.ld {d}/objs.rsp {' '.join(mod_lnk)}: linkgen {' '.join(mod_objs)} | "
             f"{d}/units.tsv {d}/layout.ld {d}/symbols.ld tools/linkgen.py",
@@ -116,11 +138,16 @@ def main():
             f"  script = {d}/link.ld",
             f"  rsp = {d}/objs.rsp",
             f"build {out}: crolink {d}/module.elf | {d}/meta.json orig/rom/romfs/{mod}.cro "
-            "tools/crolink.py tools/cro.py tools/cro_split.py",
+            f"tools/crolink.py tools/cro.py tools/cro_split.py {' '.join(target_deps(mod))}",
             f"  orig = orig/rom/romfs/{mod}.cro",
             f"  meta = {d}/meta.json",
         ]
         overlay_cros.append(out)
+    # static.crs: its anonymous imports follow the modules they point into
+    crs_out = "build/romfs_overlay/static.crs"
+    crs_targets = sorted({t for mod in overlay_mods for t in [mod]} & set(static_targets()))
+    nj += [f"build {crs_out}: crslink orig/rom/romfs/static.crs | tools/crslink.py tools/crolink.py "
+           + " ".join(f"build/cro/{t}/module.elf build/cro/{t}/incoming.json" for t in crs_targets)]
     crr = "build/romfs_overlay/.crr/static.crr"
     if overlay_cros:
         nj += [
@@ -128,6 +155,7 @@ def main():
             "  orig = orig/rom/romfs/.crr/static.crr",
         ]
         overlay_cros.append(crr)
+    overlay_cros.append(crs_out)
 
     lnk_objs = [os.path.splitext(o)[0] + ".lnk.o" for o in src_objs]
     nj += [
@@ -142,7 +170,7 @@ def main():
         "default build/rom.3ds",
     ]
     open("build.ninja", "w").write("\n".join(nj) + "\n")
-    print(f"build.ninja: {len(asm_objs)} code.bin units, {len(overlay_cros) - 1 if overlay_cros else 0} CRO modules, "
+    print(f"build.ninja: {len(asm_objs)} code.bin units, {len(overlay_mods)} CRO modules, "
           f"{len(sources) + module_sources} C++ sources ({module_sources} in modules)")
 
 
