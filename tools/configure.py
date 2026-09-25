@@ -6,7 +6,7 @@ Build graph:
   src/**/*.cpp   --armcc-->  build/src/**/*.o   (src/cro/<Module>/ goes into that module)
   (objects)      --linkgen-> build/link.ld, build/objs.rsp, *.lnk.o  (C++ replaces asm units)
   link.ld        --ld-->     build/code.elf --objcopy--> build/code.bin
-  asm/cro/<Module>/*.s --as/ld/mkcro--> build/romfs_overlay/<Module>.cro (+ .crr/static.crr)
+  asm/cro/<Module>/*.s --as/ld.lld/crolink--> build/romfs_overlay/<Module>.cro (+ .crr/static.crr)
   orig/rom/romfs + overlay --ctr.py--> build/romfs.bin
   code.bin + romfs.bin + orig/rom parts --mkrom--> build/rom.3ds
 """
@@ -54,12 +54,9 @@ def main():
         "rule ldcro",
         "  command = ld.lld --emit-relocs -T $script -o $out @$rsp",
         "  description = LD $out",
-        "rule textbin",
-        "  command = arm-none-eabi-objcopy -O binary -j .text $in $out",
-        "  description = OBJCOPY $out",
-        "rule mkcro",
-        "  command = $PYTHON tools/mkcro.py $orig $in $out --elf $elf --imports $imports",
-        "  description = CRO $out",
+        "rule crolink",
+        "  command = $PYTHON tools/crolink.py $orig $in $meta $out",
+        "  description = CROLINK $out",
         "rule crr",
         "  command = $PYTHON tools/cro.py crr $orig $out $in",
         "  description = CRR $out",
@@ -104,21 +101,24 @@ def main():
             nj.append(f"build {o}: cc {src} | {' '.join(headers)}")
             mod_objs.append(o)
         mod_lnk = [os.path.splitext(o)[0] + ".lnk.o" for o in mod_objs]
+        seg_objs = []
+        for kind in ("rodata", "data", "bss"):
+            o = f"{d}/{kind}.o"
+            nj.append(f"build {o}: as asm/cro/{mod}/{kind}.s | asm/macros.inc orig/rom/romfs/{mod}.cro")
+            seg_objs.append(o)
         out = f"build/romfs_overlay/{mod}.cro"
         nj += [
             f"build {d}/link.ld {d}/objs.rsp {' '.join(mod_lnk)}: linkgen {' '.join(mod_objs)} | "
             f"{d}/units.tsv {d}/layout.ld {d}/symbols.ld tools/linkgen.py",
             f"  args = --units {d}/units.tsv --objdir {d} --layout {d}/layout.ld --ld {d}/symbols.ld "
-            f"--out {d}/link.ld --rsp {d}/objs.rsp",
-            f"build {d}/text.elf: ldcro {' '.join(objs + mod_lnk)} | {d}/link.ld {d}/objs.rsp",
+            f"--out {d}/link.ld --rsp {d}/objs.rsp " + " ".join(f"--extra {o}" for o in seg_objs),
+            f"build {d}/module.elf: ldcro {' '.join(objs + seg_objs + mod_lnk)} | {d}/link.ld {d}/objs.rsp",
             f"  script = {d}/link.ld",
             f"  rsp = {d}/objs.rsp",
-            f"build {d}/text.bin: textbin {d}/text.elf",
-            f"build {out}: mkcro {d}/text.bin | {d}/text.elf {d}/imports.tsv orig/rom/romfs/{mod}.cro "
-            "tools/mkcro.py tools/cro.py tools/cro_split.py",
+            f"build {out}: crolink {d}/module.elf | {d}/meta.json orig/rom/romfs/{mod}.cro "
+            "tools/crolink.py tools/cro.py tools/cro_split.py",
             f"  orig = orig/rom/romfs/{mod}.cro",
-            f"  elf = {d}/text.elf",
-            f"  imports = {d}/imports.tsv",
+            f"  meta = {d}/meta.json",
         ]
         overlay_cros.append(out)
     crr = "build/romfs_overlay/.crr/static.crr"
