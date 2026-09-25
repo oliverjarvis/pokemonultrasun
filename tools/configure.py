@@ -75,7 +75,7 @@ def main():
         "  command = $PYTHON tools/crolink.py $orig $in $meta $out",
         "  description = CROLINK $out",
         "rule crslink",
-        "  command = $PYTHON tools/crslink.py $in $out",
+        "  command = $PYTHON tools/crslink.py $in $out --elf build/code.elf --meta build/codebin_meta.json",
         "  description = CRSLINK $out",
         "rule crr",
         "  command = $PYTHON tools/cro.py crr $orig $out $in",
@@ -84,10 +84,12 @@ def main():
         "  command = $PYTHON tools/ctr.py romfs orig/rom/romfs $out --overlay build/romfs_overlay",
         "  description = ROMFS $out",
         "rule rom",
-        "  command = $PYTHON tools/mkrom.py --code build/code.bin --romfs build/romfs.bin --out $out",
+        "  command = $PYTHON tools/mkrom.py --code build/code.bin --elf build/code.elf --romfs build/romfs.bin --out $out",
         "  description = ROM $out",
         "",
-        "build build/data.o: as asm/data.s | orig/exefs/code.bin",
+        "build build/data/rodata.o: as asm/data/rodata.s | asm/macros.inc orig/exefs/code.bin",
+        "build build/data/data.o: as asm/data/data.s | asm/macros.inc orig/exefs/code.bin",
+        "build build/data/bss.o: as asm/data/bss.s | asm/macros.inc",
     ]
     asm_objs = []
     for a in units:
@@ -147,6 +149,7 @@ def main():
     crs_out = "build/romfs_overlay/static.crs"
     crs_targets = sorted({t for mod in overlay_mods for t in [mod]} & set(static_targets()))
     nj += [f"build {crs_out}: crslink orig/rom/romfs/static.crs | tools/crslink.py tools/crolink.py "
+           "build/code.elf build/codebin_meta.json "
            + " ".join(f"build/cro/{t}/module.elf build/cro/{t}/incoming.json" for t in crs_targets)]
     crr = "build/romfs_overlay/.crr/static.crr"
     if overlay_cros:
@@ -160,13 +163,14 @@ def main():
     lnk_objs = [os.path.splitext(o)[0] + ".lnk.o" for o in src_objs]
     nj += [
         f"build build/link.ld build/objs.rsp {' '.join(lnk_objs)}: linkgen {' '.join(src_objs)} | build/units.tsv build/layout.ld "
-        "build/asm_syms.ld config/symbols.txt tools/linkgen.py",
-        "  args = --units build/units.tsv --objdir build/text --layout build/layout.ld --ld build/asm_syms.ld "
-        "--ld config/symbols.txt --out build/link.ld --rsp build/objs.rsp --extra build/data.o",
-        f"build build/code.elf: ld build/data.o {' '.join(asm_objs + lnk_objs)} | build/link.ld build/objs.rsp",
+        "build/config_syms.ld tools/linkgen.py",
+        "  args = --units build/units.tsv --objdir build/text --layout build/layout.ld --ld build/config_syms.ld "
+        "--out build/link.ld --rsp build/objs.rsp --extra build/data/rodata.o --extra build/data/data.o "
+        "--extra build/data/bss.o",
+        f"build build/code.elf: ld build/data/rodata.o build/data/data.o build/data/bss.o {' '.join(asm_objs + lnk_objs)} | build/link.ld build/objs.rsp",
         "build build/code.bin: bin build/code.elf",
         f"build build/romfs.bin: romfs | tools/ctr.py {' '.join(romfs_files + overlay_cros)}",
-        f"build build/rom.3ds: rom build/code.bin build/romfs.bin | tools/mkrom.py tools/ctr.py {' '.join(rom_parts)}",
+        f"build build/rom.3ds: rom build/code.bin build/romfs.bin | build/code.elf tools/mkrom.py tools/ctr.py {' '.join(rom_parts)}",
         "default build/rom.3ds",
     ]
     open("build.ninja", "w").write("\n".join(nj) + "\n")

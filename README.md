@@ -17,7 +17,7 @@ remainder from generated assembly, then packs everything into a `.3ds` image tha
 | `code.bin` (main executable, 4.95 MB of ARM code) | Builds byte-identical |
 | Decompiled to C++ | **13 / 64,326** functions (7 in `code.bin`, 6 in `Battle` / `FieldRo`); see `tools/progress.py` |
 | CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (38,345 functions + 16,676 import veneers); **relinkable**, so code can change size |
-| `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so `code.bin` code cannot grow yet |
+| `.rodata` / `.data` of `code.bin` | Symbolized (29,878 pointers found heuristically, 632 relative constructor entries); `code.bin` is **relinkable** |
 | RomFS, ExeFS, NCCH, NCSD containers | Rebuilt from files, byte-identical |
 
 ## Target
@@ -148,7 +148,15 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
 - **Analysis** (`tools/analyze.py`) traces the executable from every known entry point: named
   exports, call targets, vtables and other data pointers, and the place-relative `.init_array`.
   It classifies about 90% of `.text` as instructions and 3% as literal pools and jump tables, and
-  keeps the remainder as raw words.
+  keeps the remainder as raw words. ARM entry points inside the Thumb C library (ARM-state stubs
+  such as `add ip, pc, #1; bx ip`) are carved out of the Thumb regions.
+- **Pointers in `code.bin`** (`tools/pointers.py`): the executable has no relocations, so words
+  are treated as pointers when their value lies in the memory image. UTF-16 look-alikes (two ASCII
+  characters, e.g. `"_N"` = `0x004E005F`, fall in the address range), multiples of 0x10000 and
+  implausible code targets are excluded. `.rodata`/`.data`/`.bss` are emitted as assembly with a
+  label at every target (`data_<ADDR>`) and `.4byte <symbol>` at every pointer; the constructor
+  table is `.4byte <function> - .`. Units that share literal pools (SDK code) are merged, Thumb
+  regions are their own units, and ARM/Thumb calls are symbolic.
 - **Splitting** (`tools/split.py`) emits relocatable assembly: branches, literal pools and jump
   tables refer to symbols, and each unit lives in a `.text.<ADDR>` section so that a single
   `SORT_BY_NAME` rule places it at its original address.
@@ -171,6 +179,9 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
   linked ELF, so references stay correct when the target module changes size. Entries follow the original
   order (recorded per relocation as unit + offset), so unchanged modules come out byte-identical,
   and modules whose code grew get correct new tables.
+- **`code.bin` layout**: `.rodata` and `.data` are page-aligned after `.text`, `.bss` follows.
+  `mkrom.py` writes the exheader's code set info from the linked ELF, and `crslink.py` rebuilds
+  `static.crs`'s segment table, its 4,916 exports and the 671 words modules patch in `code.bin`.
 - **Linking** (`tools/linkgen.py`) renames each armcc function section (`i.<symbol>`) to its
   unit's address. A compiled function must be exactly the size of the unit it replaces.
 - **Packaging** (`tools/ctr.py`, `tools/mkrom.py`) rebuilds the RomFS (including its IVFC hash
@@ -197,7 +208,7 @@ tools/         extraction, analysis, build and verification scripts
 |---|---|
 | `extract.py`, `unpack.py` | Extract code and every container part from a dump |
 | `inventory.py`, `symbols.py` | Code size report and CRO exports; `static.crs` symbol table |
-| `analyze.py`, `split.py`, `asmemit.py` | Find functions and code/data; generate per-function assembly |
+| `analyze.py`, `split.py`, `asmemit.py`, `pointers.py` | Find functions and code/data; generate relinkable assembly; pointer heuristics |
 | `cro.py`, `cro_split.py`, `crolink.py`, `crslink.py` | CRO/CRR formats; split modules into relinkable asm; module linker; `static.crs` rebuild |
 | `configure.py`, `linkgen.py` | Generate `build.ninja`; place compiled C++ at unit addresses |
 | `ctr.py`, `mkrom.py`, `pad.py` | Build RomFS / ExeFS / NCCH / NCSD images |
@@ -207,8 +218,7 @@ tools/         extraction, analysis, build and verification scripts
 
 ## Roadmap
 
-- Make `code.bin` relinkable too: symbolize its `.rodata` / `.data` (no relocation tables, so
-  pointers have to be identified heuristically), regenerate the exheader and `static.crs`
+- Harden the `code.bin` pointer heuristics (see `tools/pointers.py`) as modified builds are tested
 - Symbolize `.rodata` / `.data` so that modified code can change size
 - Grow C++ coverage, starting with the `pml` (Pokémon data and battle rules) and `item` libraries
 

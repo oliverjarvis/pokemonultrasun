@@ -164,6 +164,7 @@ class Region:
         """Write <out_dir>/<ADDR>.s per unit; returns [(addr, size, symbol)]."""
         local, glob, thumb_labels = self._labels()
         self.thumb_labels = thumb_labels
+        self._glob = glob
 
         def sym_for(tgt):
             if self.in_thumb(tgt):
@@ -191,6 +192,19 @@ class Region:
                 f.write("\n".join(lines) + "\n")
             units.append((s, e - s, sym))
         return units
+
+    def global_name(self, tgt):
+        """Global symbol for a text address (valid after emit); KeyError if it has none."""
+        if self.in_thumb(tgt):
+            if tgt in self.thumb_labels:
+                return self.thumb_sym(tgt)
+        elif tgt in self.starts:
+            return self.unit_sym(tgt)
+        elif tgt in self.names:
+            return self.names[tgt]
+        elif tgt in self._glob:
+            return f"loc_{tgt:08X}"
+        raise KeyError(f"no global label at {tgt:#x}")
 
     def _data_word(self, a, w, sym_for):
         r = self.word_ref(a, w)
@@ -282,6 +296,31 @@ class Region:
             a += 2
         lines += [".arm", f"    .size {sym}, . - {sym}"]
         return lines, sym
+
+
+def emit_segment(path, kind, module_file, file_off, size, labels, words):
+    """Assembly for a non-text segment: original bytes, labels, symbolic words.
+
+    labels: offset -> [names]; words: offset -> assembler expression. A word
+    with a label inside it (a pointer to the middle of a pointer: one of the two
+    is a look-alike) is kept as raw bytes."""
+    words = {o: e for o, e in words.items() if not any(o + k in labels for k in (1, 2, 3))}
+    lines = [".include \"macros.inc\"", f".section .{kind}, \"{'aw' if kind != 'rodata' else 'a'}\"" +
+             (", %nobits" if kind == "bss" else ""), ""]
+    cuts = sorted({0, size} | set(labels) | set(words) | {o + 4 for o in words})
+    for a, b in zip(cuts, cuts[1:] + [None]):
+        for name in labels.get(a, []):
+            lines.append(f"dlabel {name}")
+        if b is None:
+            break
+        if a in words:
+            lines.append(f"    .4byte {words[a]} /* {a:08X} */")
+        elif kind == "bss":
+            lines.append(f"    .space {b - a:#x}")
+        else:
+            lines.append(f"    .incbin \"{module_file}\", {file_off + a:#x}, {b - a:#x}")
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 MACROS = (".syntax unified\n.arm\n.text\n"
