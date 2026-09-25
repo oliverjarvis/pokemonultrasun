@@ -15,7 +15,7 @@ remainder from generated assembly, then packs everything into a `.3ds` image tha
 | Component | State |
 |---|---|
 | `code.bin` (main executable, 4.95 MB of ARM code) | Builds byte-identical |
-| Decompiled to C++ | **7 / 81,002** functions (all in `code.bin` so far) |
+| Decompiled to C++ | **13 / 81,002** functions (7 in `code.bin`, 6 in `Battle` / `FieldRo`) |
 | CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (55,021 functions) |
 | `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so code cannot grow yet |
 | RomFS, ExeFS, NCCH, NCSD containers | Rebuilt from files, byte-identical |
@@ -113,8 +113,14 @@ always matches. Run the Python tools with `.venv/bin/python`.
    `tools/check.py`. For a quicker look at one object, `tools/objcmp.py build/src/<file>.o -v`
    reports each function as `MATCH` or with a count of differing words.
 4. **Symbols** that your code references but that aren't decompiled yet (data tables, callees) go
-   in `config/symbols.txt` with their addresses.
-5. **Near misses** can be committed under `#ifdef NONMATCHING` with a note on what differs.
+   in `config/symbols.txt` with their addresses (for `code.bin`).
+5. **Module functions** go in `src/cro/<Module>/`. Unnamed functions keep their placeholder name
+   through `extern "C"` (`bool sub_000602D4(u16)`), and so do their callees. The module's own data
+   is available as `rodata_<OFF>`, `data_<OFF>` and `bss_<OFF>` for every relocation target, and
+   `code.bin` symbols by their real (mangled) names, which link to the module's import veneers.
+   Real names for module functions and data go in `config/cro/<Module>.txt`
+   (`<symbol> <segment> <offset>`; re-run `cro_split.py` afterwards).
+6. **Near misses** can be committed under `#ifdef NONMATCHING` with a note on what differs.
    Only matching code is linked.
 
 On [decomp.me](https://decomp.me), use the **Nintendo 3DS** platform with **armcc 4.1 build 1454**
@@ -152,6 +158,11 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
   `bl veneer__ZN3pml8pokepara9CoreParam7SetWazaEh6WazaNo`. Each module's `.text` is linked at its
   file offset and spliced back into the module with its tables. `mkcro.py` then recomputes the
   module's four SHA-256 hashes, and `static.crr` is regenerated from the built modules.
+- **C++ in modules**: modules are linked with `--emit-relocs`, and `mkcro.py` zeroes every absolute
+  relocation the C++ produced (relocated words are zero in a CRO). It checks each one against the
+  module's tables: internal references must hit the same segment and offset, imports the same
+  import. An address the tables don't list is an error. This catches mistakes that byte comparison
+  can't, such as referencing the wrong table.
 - **Linking** (`tools/linkgen.py`) renames each armcc function section (`i.<symbol>`) to its
   unit's address. A compiled function must be exactly the size of the unit it replaces.
 - **Packaging** (`tools/ctr.py`, `tools/mkrom.py`) rebuilds the RomFS (including its IVFC hash
@@ -187,7 +198,7 @@ tools/         extraction, analysis, build and verification scripts
 
 ## Roadmap
 
-- C++ in CRO modules: generate their relocation and import tables from compiled objects
+- Symbolize module `.rodata` / `.data` so modules can change size too
 - Symbolize `.rodata` / `.data` so that modified code can change size
 - Grow C++ coverage, starting with the `pml` (Pokémon data and battle rules) and `item` libraries
 

@@ -3,7 +3,7 @@
 
 Build graph:
   asm/text/*.s   --as-->     build/text/*.o
-  src/**/*.cpp   --armcc-->  build/src/**/*.o
+  src/**/*.cpp   --armcc-->  build/src/**/*.o   (src/cro/<Module>/ goes into that module)
   (objects)      --linkgen-> build/link.ld, build/objs.rsp, *.lnk.o  (C++ replaces asm units)
   link.ld        --ld-->     build/code.elf --objcopy--> build/code.bin
   asm/cro/<Module>/*.s --as/ld/mkcro--> build/romfs_overlay/<Module>.cro (+ .crr/static.crr)
@@ -23,7 +23,7 @@ CFLAGS = (f"-c --cpu=MPCore --fpmode=fast --apcs=/interwork -I {ARMCC_DIR}/inclu
 def main():
     os.chdir(ROOT)
     units = [l.split("\t")[0] for l in open("build/units.tsv").read().splitlines()[1:]]
-    sources = sorted(glob.glob("src/**/*.cpp", recursive=True))
+    sources = sorted(f for f in glob.glob("src/**/*.cpp", recursive=True) if not f.startswith("src/cro/"))
     headers = sorted(glob.glob("include/**/*.h", recursive=True))
     esc = lambda path: path.replace("$", "$$").replace(" ", "$ ").replace(":", "$:")
     romfs_files = [esc(f) for f in sorted(glob.glob("orig/rom/romfs/**/*", recursive=True)) if os.path.isfile(f)]
@@ -43,7 +43,7 @@ def main():
         "  command = $ARMCC $CFLAGS -o $out $in",
         "  description = ARMCC $in",
         "rule linkgen",
-        "  command = $PYTHON tools/linkgen.py $in",
+        "  command = $PYTHON tools/linkgen.py $args $in",
         "  description = LINKGEN",
         "rule ld",
         "  command = ld.lld -T build/link.ld -o $out @build/objs.rsp",
@@ -52,13 +52,13 @@ def main():
         "  command = arm-none-eabi-objcopy -O binary $in $out && python3 tools/pad.py $out",
         "  description = OBJCOPY $out",
         "rule ldcro",
-        "  command = ld.lld -T $layout -o $out @$rsp",
+        "  command = ld.lld --emit-relocs -T $script -o $out @$rsp",
         "  description = LD $out",
         "rule textbin",
         "  command = arm-none-eabi-objcopy -O binary -j .text $in $out",
         "  description = OBJCOPY $out",
         "rule mkcro",
-        "  command = $PYTHON tools/mkcro.py $orig $in $out",
+        "  command = $PYTHON tools/mkcro.py $orig $in $out --elf $elf --imports $imports",
         "  description = CRO $out",
         "rule crr",
         "  command = $PYTHON tools/cro.py crr $orig $out $in",
@@ -84,27 +84,41 @@ def main():
         src_objs.append(o)
     # CRO modules: assemble, link .text at its file offset, splice into the module
     overlay_cros = []
+    module_sources = 0
     for mod in sorted(os.listdir("build/cro")) if os.path.isdir("build/cro") else []:
         units_tsv = f"build/cro/{mod}/units.tsv"
         if not os.path.exists(units_tsv):
             continue
+        d = f"build/cro/{mod}"
         objs = []
         for line in open(units_tsv).read().splitlines()[1:]:
             a = line.split("\t")[0]
-            o = f"build/cro/{mod}/{a}.o"
+            o = f"{d}/{a}.o"
             nj.append(f"build {o}: as asm/cro/{mod}/{a}.s | asm/macros.inc")
             objs.append(o)
-        rsp = f"build/cro/{mod}/objs.rsp"
-        with open(rsp, "w") as f:
-            f.write(" ".join(objs) + "\n")
+        mod_srcs = sorted(glob.glob(f"src/cro/{mod}/**/*.cpp", recursive=True))
+        module_sources += len(mod_srcs)
+        mod_objs = []
+        for src in mod_srcs:
+            o = "build/" + os.path.splitext(src)[0] + ".o"
+            nj.append(f"build {o}: cc {src} | {' '.join(headers)}")
+            mod_objs.append(o)
+        mod_lnk = [os.path.splitext(o)[0] + ".lnk.o" for o in mod_objs]
         out = f"build/romfs_overlay/{mod}.cro"
         nj += [
-            f"build build/cro/{mod}/text.elf: ldcro {' '.join(objs)} | build/cro/{mod}/layout.ld {rsp}",
-            f"  layout = build/cro/{mod}/layout.ld",
-            f"  rsp = {rsp}",
-            f"build build/cro/{mod}/text.bin: textbin build/cro/{mod}/text.elf",
-            f"build {out}: mkcro build/cro/{mod}/text.bin | orig/rom/romfs/{mod}.cro tools/mkcro.py tools/cro.py",
+            f"build {d}/link.ld {d}/objs.rsp {' '.join(mod_lnk)}: linkgen {' '.join(mod_objs)} | "
+            f"{d}/units.tsv {d}/layout.ld {d}/symbols.ld tools/linkgen.py",
+            f"  args = --units {d}/units.tsv --objdir {d} --layout {d}/layout.ld --ld {d}/symbols.ld "
+            f"--out {d}/link.ld --rsp {d}/objs.rsp",
+            f"build {d}/text.elf: ldcro {' '.join(objs + mod_lnk)} | {d}/link.ld {d}/objs.rsp",
+            f"  script = {d}/link.ld",
+            f"  rsp = {d}/objs.rsp",
+            f"build {d}/text.bin: textbin {d}/text.elf",
+            f"build {out}: mkcro {d}/text.bin | {d}/text.elf {d}/imports.tsv orig/rom/romfs/{mod}.cro "
+            "tools/mkcro.py tools/cro.py tools/cro_split.py",
             f"  orig = orig/rom/romfs/{mod}.cro",
+            f"  elf = {d}/text.elf",
+            f"  imports = {d}/imports.tsv",
         ]
         overlay_cros.append(out)
     crr = "build/romfs_overlay/.crr/static.crr"
@@ -119,6 +133,8 @@ def main():
     nj += [
         f"build build/link.ld build/objs.rsp {' '.join(lnk_objs)}: linkgen {' '.join(src_objs)} | build/units.tsv build/layout.ld "
         "build/asm_syms.ld config/symbols.txt tools/linkgen.py",
+        "  args = --units build/units.tsv --objdir build/text --layout build/layout.ld --ld build/asm_syms.ld "
+        "--ld config/symbols.txt --out build/link.ld --rsp build/objs.rsp --extra build/data.o",
         f"build build/code.elf: ld build/data.o {' '.join(asm_objs + lnk_objs)} | build/link.ld build/objs.rsp",
         "build build/code.bin: bin build/code.elf",
         f"build build/romfs.bin: romfs | tools/ctr.py {' '.join(romfs_files + overlay_cros)}",
@@ -126,8 +142,8 @@ def main():
         "default build/rom.3ds",
     ]
     open("build.ninja", "w").write("\n".join(nj) + "\n")
-    print(f"build.ninja: {len(asm_objs)} asm units, {len(sources)} C++ sources, "
-          f"{len(overlay_cros) - 1 if overlay_cros else 0} CRO modules")
+    print(f"build.ninja: {len(asm_objs)} code.bin units, {len(overlay_cros) - 1 if overlay_cros else 0} CRO modules, "
+          f"{len(sources) + module_sources} C++ sources ({module_sources} in modules)")
 
 
 if __name__ == "__main__":
