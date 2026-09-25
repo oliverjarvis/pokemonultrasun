@@ -15,8 +15,8 @@ remainder from generated assembly, then packs everything into a `.3ds` image tha
 | Component | State |
 |---|---|
 | `code.bin` (main executable, 4.95 MB of ARM code) | Builds byte-identical |
-| Decompiled to C++ | **13 / 81,002** functions (7 in `code.bin`, 6 in `Battle` / `FieldRo`) |
-| CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (55,021 functions) |
+| Decompiled to C++ | **13 / 64,326** functions (7 in `code.bin`, 6 in `Battle` / `FieldRo`); see `tools/progress.py` |
+| CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (38,345 functions + 16,676 import veneers) |
 | `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so code cannot grow yet |
 | RomFS, ExeFS, NCCH, NCSD containers | Rebuilt from files, byte-identical |
 
@@ -79,6 +79,7 @@ ignored by git.
 .venv/bin/python tools/configure.py      # writes build.ninja; re-run after adding files to src/
 ninja                                    # -> build/code.bin, build/romfs_overlay/*.cro, build/rom.3ds
 .venv/bin/python tools/check.py          # verifies code.bin, every module and the ROM
+.venv/bin/python tools/progress.py       # functions / bytes decompiled (--markdown, --json, --modules)
 ```
 
 A successful build prints:
@@ -194,6 +195,7 @@ tools/         extraction, analysis, build and verification scripts
 | `configure.py`, `linkgen.py` | Generate `build.ninja`; place compiled C++ at unit addresses |
 | `ctr.py`, `mkrom.py`, `pad.py` | Build RomFS / ExeFS / NCCH / NCSD images |
 | `check.py`, `objcmp.py` | Verify hashes; compare a compiled object against the original |
+| `progress.py` | Decompilation progress per target, from the last build |
 | `disasm.py`, `asmgen.py` | Browse disassembly; emit standalone assembly for a function |
 
 ## Roadmap
