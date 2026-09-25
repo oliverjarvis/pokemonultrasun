@@ -16,8 +16,8 @@ remainder from generated assembly, then packs everything into a `.3ds` image tha
 |---|---|
 | `code.bin` (main executable, 4.95 MB of ARM code) | Builds byte-identical |
 | Decompiled to C++ | **13 / 64,326** functions (7 in `code.bin`, 6 in `Battle` / `FieldRo`); see `tools/progress.py` |
-| CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (38,345 functions + 16,676 import veneers) |
-| `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so code cannot grow yet |
+| CRO modules (132 relocatable modules, 5.6 MB of code) | Build byte-identical from assembly (38,345 functions + 16,676 import veneers); **relinkable**, so code can change size |
+| `.rodata` / `.data` of `code.bin` | Included as binary; not yet symbolized, so `code.bin` code cannot grow yet |
 | RomFS, ExeFS, NCCH, NCSD containers | Rebuilt from files, byte-identical |
 
 ## Target
@@ -67,7 +67,7 @@ python3 tools/unpack.py  baserom.3ds      # all container parts, RomFS files   -
 python3 tools/symbols.py                  # names from static.crs              -> orig/symbols.tsv
 .venv/bin/python tools/analyze.py         # function and code/data discovery   -> orig/analysis.json
 .venv/bin/python tools/split.py           # one assembly file per function     -> asm/text/
-.venv/bin/python tools/cro_split.py       # same for every CRO module          -> asm/cro/
+.venv/bin/python tools/cro_split.py       # every CRO module: code, rodata, data -> asm/cro/
 ```
 
 This is the only step that reads the dump. `orig/`, `asm/` and `build/` are generated locally and
@@ -152,18 +152,21 @@ code.bin + romfs.bin + orig/rom/ parts ──mkrom.py──▶ build/rom.3ds
 - **Splitting** (`tools/split.py`) emits relocatable assembly: branches, literal pools and jump
   tables refer to symbols, and each unit lives in a `.text.<ADDR>` section so that a single
   `SORT_BY_NAME` rule places it at its original address.
-- **CRO modules** (`tools/cro.py`, `tools/cro_split.py`, `tools/mkcro.py`) are relocatable
+- **CRO modules** (`tools/cro.py`, `tools/cro_split.py`, `tools/crolink.py`) are relocatable
   modules loaded at runtime. All their relocations are `R_ARM_ABS32` and relocated words are zero
-  in the file, so the relocation tables say exactly which words are addresses. Calls into
-  `code.bin` go through import veneers (`ldr pc, [pc, #-4]`), which are named after the import:
-  `bl veneer__ZN3pml8pokepara9CoreParam7SetWazaEh6WazaNo`. Each module's `.text` is linked at its
-  file offset and spliced back into the module with its tables. `mkcro.py` then recomputes the
-  module's four SHA-256 hashes, and `static.crr` is regenerated from the built modules.
-- **C++ in modules**: modules are linked with `--emit-relocs`, and `mkcro.py` zeroes every absolute
-  relocation the C++ produced (relocated words are zero in a CRO). It checks each one against the
-  module's tables: internal references must hit the same segment and offset, imports the same
-  import. An address the tables don't list is an error. This catches mistakes that byte comparison
-  can't, such as referencing the wrong table.
+  in the file, so the relocation tables say exactly which words are addresses. `cro_split.py`
+  turns every one into a symbol: `.text` into per-function units, and `.rodata`/`.data`/`.bss` into
+  assembly with a label at every relocation target and a symbolic `.4byte` at every pointer, so
+  vtables read `.4byte sub_0003B6EC`. Calls into `code.bin` go through import veneers
+  (`ldr pc, [pc, #-4]`) named after the import: `bl veneer__ZN3pml8pokepara9CoreParam7SetWazaEh6WazaNo`.
+  Anonymous imports from other modules are named `<Module>__<unit>`.
+- **Module linker** (`tools/crolink.py`): each module is linked with its segments at separate bases
+  and `--emit-relocs`, then `crolink.py` writes the module from scratch. It lays out the segments,
+  turns every absolute relocation into a CRO internal or import relocation (zeroing the word),
+  regenerates the segment, export and import tables and the header, and recomputes the four
+  SHA-256 hashes. `static.crr` is regenerated from the built modules. Entries follow the original
+  order (recorded per relocation as unit + offset), so unchanged modules come out byte-identical,
+  and modules whose code grew get correct new tables.
 - **Linking** (`tools/linkgen.py`) renames each armcc function section (`i.<symbol>`) to its
   unit's address. A compiled function must be exactly the size of the unit it replaces.
 - **Packaging** (`tools/ctr.py`, `tools/mkrom.py`) rebuilds the RomFS (including its IVFC hash
@@ -191,7 +194,7 @@ tools/         extraction, analysis, build and verification scripts
 | `extract.py`, `unpack.py` | Extract code and every container part from a dump |
 | `inventory.py`, `symbols.py` | Code size report and CRO exports; `static.crs` symbol table |
 | `analyze.py`, `split.py`, `asmemit.py` | Find functions and code/data; generate per-function assembly |
-| `cro.py`, `cro_split.py`, `mkcro.py` | CRO/CRR formats; split modules; rebuild modules with new code |
+| `cro.py`, `cro_split.py`, `crolink.py` | CRO/CRR formats; split modules into relinkable asm; module linker |
 | `configure.py`, `linkgen.py` | Generate `build.ninja`; place compiled C++ at unit addresses |
 | `ctr.py`, `mkrom.py`, `pad.py` | Build RomFS / ExeFS / NCCH / NCSD images |
 | `check.py`, `objcmp.py` | Verify hashes; compare a compiled object against the original |
@@ -200,7 +203,8 @@ tools/         extraction, analysis, build and verification scripts
 
 ## Roadmap
 
-- Symbolize module `.rodata` / `.data` so modules can change size too
+- Make `code.bin` relinkable too: symbolize its `.rodata` / `.data` (no relocation tables, so
+  pointers have to be identified heuristically), regenerate the exheader and `static.crs`
 - Symbolize `.rodata` / `.data` so that modified code can change size
 - Grow C++ coverage, starting with the `pml` (Pokémon data and battle rules) and `item` libraries
 

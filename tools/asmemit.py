@@ -9,6 +9,7 @@ caller's `word_ref(addr, word)` callback, which returns one of:
   ("text", target, suffix) reference to a text address in this region
   ("expr", text)           an arbitrary assembler expression
   ("raw", comment)         keep the raw value, with a trailing comment
+`labels` are addresses that need a global label (referenced from elsewhere).
 """
 import bisect
 import os
@@ -23,8 +24,9 @@ PC_REL = re.compile(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]")
 
 
 class Region:
-    def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None):
+    def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None, labels=()):
         self.words, self.base, self.blob, self.kind = words, base, blob, kind
+        self.extra_labels = set(labels)  # addresses referenced from outside the region
         self.end = base + 4 * len(words)
         self.starts = sorted(set(starts) | {base})
         self.names = names or {}
@@ -64,6 +66,8 @@ class Region:
                 r = self.word_ref(a, w)
                 if r and r[0] == "text":
                     ref(a, r[1])
+        glob |= {a for a in self.extra_labels if a not in self.starts and self.in_text(a)}
+        local -= glob
         return local, glob
 
     def emit(self, out_dir, include="macros.inc"):
@@ -152,4 +156,5 @@ class Region:
 
 MACROS = (".syntax unified\n.arm\n.text\n"
           ".macro glabel name\n    .global \\name\n    .type \\name, %function\n\\name:\n.endm\n"
-          ".macro endlabel name\n    .size \\name, . - \\name\n.endm\n")
+          ".macro endlabel name\n    .size \\name, . - \\name\n.endm\n"
+          ".macro dlabel name\n    .global \\name\n    .type \\name, %object\n\\name:\n.endm\n")
