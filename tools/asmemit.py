@@ -33,6 +33,22 @@ from analyze import CODE, JT, LIT, branch, pc_load_targets, thumb_call
 PC_REL = re.compile(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]")
 
 
+def _imm(w):
+    rot, imm = ((w >> 8) & 0xF) * 2, w & 0xFF
+    return ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+
+
+def adrl_target(w, x, a):
+    """Address formed by an ADR at a followed by `add/sub rd, rd, #imm` (x), or None."""
+    t = adr_target(w, a)
+    rd = (w >> 12) & 0xF
+    if t is None or (x >> 25) & 7 != 1 or (x >> 16) & 0xF != rd or (x >> 12) & 0xF != rd:
+        return None
+    if (x >> 21) & 0xF not in (2, 4) or (x >> 20) & 1 or x >> 28 != w >> 28:
+        return None
+    return (t + _imm(x) if (x >> 21) & 0xF == 4 else t - _imm(x)) & 0xFFFFFFFF
+
+
 def adr_target(w, a):
     """Address formed by `add/sub rd, pc, #imm` (ADR) at a, or None."""
     if (w >> 25) & 7 != 0b001 or (w >> 16) & 0xF != 15 or (w >> 20) & 1 or (w >> 12) & 0xF == 15:
@@ -101,6 +117,9 @@ class Region:
             t = adr_target(w, a)
             if t is not None:  # ADR: its offset must not change either
                 targets.append(t & ~3)
+                t2 = adrl_target(w, self.w(a + 4), a) if self.in_text(a + 4) else None
+                if t2 is not None:  # ADRL: adr rd + add/sub rd, rd, #imm
+                    targets.append(t2 & ~3)
             for lt in targets:
                 if self.in_text(lt) and not self.in_thumb(lt):
                     us, ut = self.unit_of(a), self.unit_of(lt)
