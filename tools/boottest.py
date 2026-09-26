@@ -18,24 +18,21 @@ APP = "/Applications/Azahar.app"
 LOG = os.path.expanduser("~/Library/Application Support/Azahar/log/azahar_log.txt")
 
 
+def running(rom):
+    out = subprocess.run(["pgrep", "-f", rom], capture_output=True, text=True).stdout
+    return {int(x) for x in out.split()}
+
+
 def main():
     rom = os.path.abspath(sys.argv[1])
     seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 8
+    before = running(rom)  # never touch an instance someone else is playing
     # launch through the app bundle: running the executable directly shows a modal
     # warning that can hold up emulation
     subprocess.run(["open", "-n", "-a", APP, "--args", rom], check=True)
     time.sleep(seconds)
-    pids = [int(x) for x in subprocess.run(["pgrep", "-f", rom], capture_output=True, text=True).stdout.split()]
-    for pid in pids:
-        os.kill(pid, signal.SIGTERM)
-    deadline = time.time() + 10
-    while time.time() < deadline and subprocess.run(["pgrep", "-f", rom], capture_output=True).returncode == 0:
-        time.sleep(0.2)
-    for pid in pids:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    # read the log while the emulator still runs: Azahar writes it as it goes, but
+    # a hung game won't quit on SIGTERM and killing it loses whatever is unflushed
     bad = []
     booted = False
     last = 0.0
@@ -49,11 +46,17 @@ def main():
                 bad.append(line.strip())
                 if len(bad) >= 4:
                     break
-    if not bad and (not booted or last < 1.5):
-        # the log ends before the first second or so: the game never really ran
-        print(f"{os.path.basename(rom)}: NOBOOT (log ends at {last:.1f}s)")
-        return 2
-    print(f"{os.path.basename(rom)}: {'CRASH' if bad else 'ok'} after {seconds:.0f}s")
+    for pid in running(rom) - before:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    name = os.path.basename(rom)
+    if not bad and (not booted or last < 1.0):
+        # a good boot reaches the game's service setup at ~1.5s, then the log goes quiet
+        print(f"{name}: HANG (log stops at {last:.1f}s)")
+        return 3
+    print(f"{name}: {'CRASH' if bad else 'ok'} after {seconds:.0f}s")
     for line in bad:
         print("   ", line[:200])
     return 1 if bad else 0

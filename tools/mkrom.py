@@ -90,7 +90,9 @@ def main():
     card[0x1100:0x1200] = ncch_hdr[0x100:0x200]
     card[0x1188:0x1190] = flags
 
-    with open(args.out, "wb") as o:
+    # write beside the target and swap it in: an emulator may be running the old ROM
+    tmp = args.out + ".tmp"
+    with open(tmp, "wb") as o:
         o.write(card)
         base = placed[0][0]
         o.write(ncch_hdr)
@@ -113,6 +115,7 @@ def main():
                 o.write(chunk[: min(left, len(chunk))])
                 left -= min(left, len(chunk))
         o.truncate(filled if args.trim else capacity)
+    os.replace(tmp, args.out)
     print(f"wrote {args.out}: NCCH {ncch_size:#x}, {len(extra)} extra partitions, "
           f"{'trimmed at' if args.trim else 'filled to'} {filled if args.trim else capacity:#x}")
 

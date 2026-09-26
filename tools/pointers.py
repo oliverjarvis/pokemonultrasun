@@ -69,15 +69,22 @@ def classify(words, t, is_func, is_code, in_thumb):
     words and must not look like a small-number table; a data target is
     rejected as text or when both neighbours are small 16-bit pairs.
     """
+    def sibling(n, v):
+        """n and v both start functions in the same 64 KB: neighbouring vtable
+        entries (0x003C0038, 0x003C0054), which look like UTF-16 text or
+        small-number pairs themselves, so they don't count as such evidence."""
+        return v & 3 == 0 and n & 3 == 0 and n >> 16 == v >> 16 and is_func(v) and is_func(n)
+
     def text(a, v):
         prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
-        return (utf16_like(v) and (utf16_like(prev) or utf16_like(nxt))) or (ascii_tail(v) and ascii_word(prev))
+        return ((utf16_like(v) and any(utf16_like(n) and not sibling(n, v) for n in (prev, nxt)))
+                or (ascii_tail(v) and ascii_word(prev)))
 
     def pair_table(a, v, both):
-        prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
         if not small_pair(v):
             return False
-        return (small_pair(prev) and small_pair(nxt)) if both else (small_pair(prev) or small_pair(nxt))
+        pairs = [small_pair(n) and not sibling(n, v) for n in (words.get(a - 4, 0), words.get(a + 4, 0))]
+        return all(pairs) if both else any(pairs)
 
     def counter_column(a, v):
         """A struct field counting up by one in its high half (0x00100090,

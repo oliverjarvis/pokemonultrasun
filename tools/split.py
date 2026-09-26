@@ -232,8 +232,13 @@ def main():
             tgt = text_pointer(w)
             if tgt is None:
                 return None
+            if (kind[(tgt - t.base) >> 2] in (CODE, LIT) and tgt not in starts and tgt not in thumb_funcs
+                    and tgt not in text_labels):
+                # the middle of a function or its literal pool: a number (3600000,
+                # a heap size 0x425000)
+                return None
             return ("text", tgt, " + 1" if w & 1 and not in_thumb(tgt) else "")
-        if data_kind(w) is None:
+        if data_kind(w) is None or inside_code_ptr(w):
             return None
         data_targets.add(w)
         return ("expr", f"data_{w:08X}")
@@ -256,6 +261,15 @@ def main():
     data_ptrs = {a: p for a, p in classify(
         words, t, is_func=lambda x: x in starts or x in thumb_funcs, is_code=lambda x: x in code_words,
         in_thumb=in_thumb).items() if p[0] == "text" or data_kind(p[1])}
+    # an unaligned target inside a word that is itself a code pointer (vtable
+    # entry, constructor, boundary): the reference is the look-alike, drop it
+    # rather than leave the pointer word raw
+    code_ptr_words = {a for a, (pk, _) in data_ptrs.items() if pk == "text"} | set(ctors) | set(boundary_words)
+
+    def inside_code_ptr(v):
+        return v % 4 != 0 and (v & ~3) in code_ptr_words
+
+    data_ptrs = {a: p for a, p in data_ptrs.items() if not (p[0] == "data" and inside_code_ptr(p[1]))}
     text_labels = set(ctors.values())
     for a, (pk, v) in data_ptrs.items():
         if pk == "text":

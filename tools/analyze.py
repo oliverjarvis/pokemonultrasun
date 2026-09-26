@@ -479,9 +479,17 @@ def analyze():
             rel_targets.extend(run)
         run = []
     init_ptrs = tr.pointer_seeds(rel_targets)
-    prologue_seeds = tr.prologue_seeds()
-    gap_seeds = tr.gap_seeds()
-    prologue_seeds += tr.prologue_seeds()
+    prologue_seeds = gap_seeds = 0
+    while True:
+        prologue_seeds += tr.prologue_seeds()
+        gap_seeds += tr.gap_seeds()
+        prologue_seeds += tr.prologue_seeds()
+        # functions found since have literal pools of their own, pointing at
+        # more code (e.g. an entry scheduled before its push, reached only by address)
+        more = tr.pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT)
+        lit_ptrs += more
+        if not more:
+            break
     carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
 
     result = tr.result()
