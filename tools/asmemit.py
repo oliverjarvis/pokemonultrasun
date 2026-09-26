@@ -89,15 +89,20 @@ class Region:
         return struct.unpack_from("<H", self.blob, a - self.base)[0]
 
     def _merge_shared_pools(self):
-        """Merge runs of units linked by pc-relative loads across unit boundaries."""
+        """Merge runs of units linked by pc-relative loads or ADRs across unit
+        boundaries (an ADR into Thumb code keeps a relocation instead)."""
         spans = []
         for i, w in enumerate(self.words):
             a = self.base + 4 * i
             if self.kind[i] != CODE or a in self.force_raw or self.in_thumb(a):
                 continue
-            for lt in pc_load_targets(w, a):
+            targets = [lt & ~3 for lt in pc_load_targets(w, a)]
+            t = adr_target(w, a)
+            if t is not None:  # ADR: its offset must not change either
+                targets.append(t & ~3)
+            for lt in targets:
                 if self.in_text(lt) and not self.in_thumb(lt):
-                    us, ut = self.unit_of(a), self.unit_of(lt & ~3)
+                    us, ut = self.unit_of(a), self.unit_of(lt)
                     if us != ut:
                         spans.append((min(us, ut), max(us, ut)))
         if not spans:
