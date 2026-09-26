@@ -312,10 +312,10 @@ def main():
     data_ptrs = {a: p for a, p in classify(
         words, t, is_func=lambda x: x in starts or x in thumb_funcs, is_code=lambda x: x in code_words,
         in_thumb=in_thumb, thumb_entry=thumb_entry).items() if p[0] == "text" or data_kind(p[1])}
-    # an unaligned target inside a word that is itself a code pointer (vtable
-    # entry, constructor, boundary): the reference is the look-alike, drop it
-    # rather than leave the pointer word raw
-    code_ptr_words = {a for a, (pk, _) in data_ptrs.items() if pk == "text"} | set(ctors) | set(boundary_words)
+    # an unaligned target inside a word that is itself a pointer (vtable entry,
+    # typeinfo, string table entry, constructor, boundary): the reference is the
+    # look-alike, drop it rather than leave the pointer word raw
+    code_ptr_words = set(data_ptrs) | set(ctors) | set(boundary_words)
 
     def inside_code_ptr(v):
         return v % 4 != 0 and (v & ~3) in code_ptr_words

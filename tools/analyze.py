@@ -483,7 +483,7 @@ def relative_tables(t, tr):
         tr.drain()
 
 
-def carve_arm_from_thumb(t, tr, regions):
+def carve_arm_from_thumb(t, tr, regions, pointers=()):
     """ARM code inside the Thumb library regions (ARM-state entry stubs such as
     `add ip, pc, #1; bx ip`, small ARM helpers): every ARM b/bl target, Thumb
     BLX target and ARM push {..., lr} that lands in a Thumb region is ARM code. Trace each one
@@ -498,6 +498,13 @@ def carve_arm_from_thumb(t, tr, regions):
             br = branch(t.words[i], a)
             if br and br[0] != "blx" and tr.idx(br[1]) in tr.thumb:
                 entries.add(br[1])
+        for v in pointers:
+            # an even pointer (vtable slot) into a Thumb region at an ARM `b` to a
+            # known function: a one-instruction ARM function (0x302CE0)
+            if tr.in_text(v) and not v & 3 and tr.idx(v) in tr.thumb:
+                br = branch(tr.w(v), v)
+                if br and br[0] == "b" and tr.w(v) >> 28 == AL and br[1] in tr.funcs:
+                    entries.add(v)
         for i in tr.thumb:
             # an ARM push {..., lr}: ARMv6 Thumb has no 32-bit instruction
             # starting 0xE92D, so this is an ARM function nothing branches to
@@ -682,7 +689,8 @@ def analyze():
     blx_thumb = thumb_gaps(t, tr)
     blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
                                + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
-    carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
+    carved += carve_arm_from_thumb(t, tr, thumb_regions,  # code found since may branch into Thumb too
+                                   struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
 
     result = tr.result()
     result["thumb"] = thumb_runs(tr)
