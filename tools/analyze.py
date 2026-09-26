@@ -407,6 +407,27 @@ class Tracer:
                 f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
 
 
+def entry_stubs(t, tr):
+    """Code-module headers embedded in .text (the blending kernels): a link word
+    pointing at another header's entry, `b entry`, a size and a tag. An untraced
+    word pointing at an untraced unconditional `b` to a known function is such a
+    link: the `b` becomes code and the link a literal (so both get symbols)."""
+    found = 0
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] or i in tr.thumb or not tr.in_text(w) or w & 3:
+            continue
+        j = tr.idx(w)
+        if tr.kind[j] or j in tr.thumb:
+            continue
+        br = branch(tr.words[j], w)
+        if br and br[0] == "b" and tr.words[j] >> 28 == AL and br[1] in tr.funcs:
+            tr.seed(w)
+            tr.kind[i] = LIT
+            found += 1
+    tr.drain()
+    return found
+
+
 def relative_tables(t, tr):
     """Tables of offsets from their own start, used as
 
@@ -657,6 +678,7 @@ def analyze():
         if not more:
             break
     reltab_targets = relative_tables(t, tr)
+    stubs = entry_stubs(t, tr)
     blx_thumb = thumb_gaps(t, tr)
     blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
                                + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
@@ -668,7 +690,7 @@ def analyze():
     print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx / odd pointers")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps); "
-          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries)")
+          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries), {stubs} module entry stubs")
     print("text " + tr.summary())
 
 
