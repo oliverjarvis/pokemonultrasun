@@ -285,6 +285,62 @@ class Tracer:
                 break
         return total
 
+    def gap_seeds(self, max_len=256):
+        """Seed untraced gaps that hold ARM code (see _code_run), at the gap start or
+        at an LR-saving prologue inside it. Code that nothing seeds (a function
+        after a return, reached only indirectly) would otherwise stay raw words
+        with position-dependent branches inside."""
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+        total = 0
+        for _ in range(8):
+            added = 0
+            i, n = 0, len(self.words)
+            while i < n:
+                if self.kind[i] or i in self.thumb:
+                    i += 1
+                    continue
+                j = i
+                while j < n and not self.kind[j] and j not in self.thumb:
+                    j += 1
+                # candidate starts: the gap start, and any LR-saving prologue inside it
+                starts = [i] + [x for x in range(i + 1, j)
+                                if self.words[x] & 0xFFFF4000 == 0xE92D4000 or self.words[x] == 0xE52DE004]
+                for c in starts:
+                    if self._code_run(c, j, md, max_len) and self.seed(self.base + 4 * c):
+                        added += 1
+                i = j
+            self.drain()
+            total += added
+            if not added:
+                break
+        return total
+
+    def _code_run(self, i, j, md, max_len):
+        """Words from index i decode as plausible ARM code up to an unconditional
+        return/branch: unconditional first instruction, no zero or small-number
+        words (top byte 0), no LDRD/STRD with an odd register, targets in .text."""
+        if self.words[i] >> 28 != AL:
+            return False
+        k = i
+        while k < j and k - i < max_len:
+            w = self.words[k]
+            a = self.base + 4 * k
+            if w >> 24 == 0 or next(md.disasm(struct.pack("<I", w), a), None) is None:
+                return False
+            if w & 0x0E1000D0 == 0x000000D0 and (w >> 12) & 1:  # LDRD/STRD (L=0, SH=1x) with odd Rt
+                return False
+            if any(not self.in_text(lt) for lt in pc_load_targets(w, a)):
+                return False
+            br = branch(w, a)
+            if br and not self.in_text(br[1] & ~1):
+                return False
+            if w >> 28 == AL and (writes_pc(w) == "ret" or (br and br[0] == "b")):
+                return True
+            k += 1
+        return False
+
     def runs(self, val):
         out, s = [], None
         n = len(self.words)
@@ -421,6 +477,8 @@ def analyze():
         run = []
     init_ptrs = tr.pointer_seeds(rel_targets)
     prologue_seeds = tr.prologue_seeds()
+    gap_seeds = tr.gap_seeds()
+    prologue_seeds += tr.prologue_seeds()
     carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
 
     result = tr.result()
@@ -428,7 +486,7 @@ def analyze():
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
     print(f"carved {carved} ARM entry points out of Thumb regions")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
-          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues)")
+          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps)")
     print("text " + tr.summary())
 
 

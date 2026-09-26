@@ -1,1 +1,2 @@
 0010EEF0  as: VFP single precision register expected
+0010EEE0  as: VFP single precision register expected

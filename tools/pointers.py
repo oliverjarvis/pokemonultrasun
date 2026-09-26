@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Heuristics for recognising pointers in code.bin, which has no relocations.
 
-A word is treated as a pointer when its value lies inside the executable's
-memory image (.text through the end of .bss) and it isn't one of the common
-look-alikes:
+A word is a pointer candidate when its value lies inside the executable's
+memory image (.text through the end of .bss) and isn't a multiple of 0x10000
+(typically a size such as 0x200000). Context then removes look-alikes:
+
   * UTF-16 text: two ASCII characters stored as UTF-16 (0x00HH00LL) fall in
-    the address range, e.g. "_N" = 0x004E005F;
-  * round constants (multiples of 0x10000), typically sizes such as 0x200000.
-Callers apply further target checks (code pointers must hit a function or a
-traced instruction, Thumb pointers must be odd, ...).
+    the address range ("_N" = 0x004E005F). A UTF-16-like word is text when a
+    neighbouring word is UTF-16-like too; an isolated one (e.g. a vtable
+    entry that happens to be 0x0036004C) stays a candidate.
+  * ASCII string tails: "LYT\\0" = 0x0054594C; three printable bytes and a NUL
+    after a word of printable ASCII.
+  * tables of small 16-bit pairs (0x00140040): both halves below 0x100 and
+    neighbours of the same shape. Code addresses always have a small high
+    half, so this only counts against weaker evidence (see classify()).
+
+See classify() for how the evidence is weighed.
 """
 
 
@@ -17,10 +24,75 @@ def utf16_like(v):
     return b[1] == 0 and b[3] == 0 and 0x20 <= b[0] < 0x7F and (0x20 <= b[2] < 0x7F or b[2] == 0)
 
 
+def printable(b):
+    return 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D)
+
+
+def ascii_word(v):
+    return all(printable(b) for b in v.to_bytes(4, "little"))
+
+
+def ascii_tail(v):
+    b = v.to_bytes(4, "little")
+    return b[3] == 0 and printable(b[0]) and printable(b[1]) and printable(b[2])
+
+
+def small_pair(v):
+    return (v >> 16) < 0x100 and (v & 0xFFFF) < 0x100
+
+
+def in_image(v, t):
+    return t.base <= v < t.bss_end and v % 0x10000 != 0
+
+
 def looks_like_pointer(v, t):
-    """t: analyze.Text (base, ro, data, bss_end)."""
-    if not (t.base <= v < t.bss_end):
-        return False
-    if v % 0x10000 == 0 or utf16_like(v):
-        return False
-    return True
+    """Context-free check, for literal pools in .text (the code loads them, so
+    text and number tables don't apply there)."""
+    return in_image(v, t)
+
+
+def classify(words, t, is_func, is_code, in_thumb):
+    """Pointer words in a data segment.
+
+    words: {address: value} for every aligned word of .rodata/.data.
+    is_func(tgt): tgt is a function start / Thumb function; is_code(tgt): tgt is
+    a traced instruction. Returns {address: ("text" | "data", value)}.
+
+    Evidence is tiered: a function-start target is only rejected as text or
+    inside a table of small 16-bit pairs (both neighbours);
+    a mid-function target also needs an accepted code pointer within two
+    words and must not look like a small-number table; a data target is
+    rejected as text or when both neighbours are small 16-bit pairs.
+    """
+    def text(a, v):
+        prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
+        return (utf16_like(v) and (utf16_like(prev) or utf16_like(nxt))) or (ascii_tail(v) and ascii_word(prev))
+
+    def pair_table(a, v, both):
+        prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
+        if not small_pair(v):
+            return False
+        return (small_pair(prev) and small_pair(nxt)) if both else (small_pair(prev) or small_pair(nxt))
+
+    out = {}
+    pending = []  # mid-code targets, decided once function pointers are known
+    for a, v in words.items():
+        if not in_image(v, t) or text(a, v):
+            continue
+        if t.in_text(v):
+            tgt = v & ~1
+            if v & 1:
+                if in_thumb(tgt) and is_func(tgt):
+                    out[a] = ("text", v)
+            elif tgt % 4 == 0 and not in_thumb(tgt):
+                if is_func(tgt):
+                    if not pair_table(a, v, both=True):
+                        out[a] = ("text", v)
+                elif is_code(tgt) and not pair_table(a, v, both=False):
+                    pending.append((a, v))
+        elif not pair_table(a, v, both=True):
+            out[a] = ("data", v)
+    for a, v in pending:
+        if any(out.get(a + 4 * k, ("",))[0] == "text" for k in (-2, -1, 1, 2)):
+            out[a] = ("text", v)
+    return out

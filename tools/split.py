@@ -24,10 +24,10 @@ import json
 import os
 import struct
 
-from analyze import CODE, JT, LIT, Text
+from analyze import CODE, JT, LIT, Text, branch, pc_load_targets, thumb_call
 from asmemit import MACROS, Region, emit_segment
 from cro import Cro
-from pointers import looks_like_pointer
+from pointers import classify, looks_like_pointer
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 ORIG = os.path.join(ROOT, "orig")
@@ -66,6 +66,80 @@ def init_array(t, starts):
             out.update(run)
         run = []
     return out
+
+
+def thumb_entry_points(t, an, names):
+    """Thumb function entries: named Thumb symbols, ARM blx and Thumb bl targets."""
+    out = set()
+    for line in open(os.path.join(ORIG, "symbols.tsv")).read().splitlines()[1:]:
+        addr, mode, seg, mangled, dm = line.split("\t")
+        if mode == "thumb":
+            out.add(int(addr, 16))
+    for s, e in an["code"]:
+        for a in range(s, e, 4):
+            br = branch(t.w(a), a)
+            if br and br[0] == "blx":
+                out.add(br[1] & ~1)
+    for s, e in an["thumb"]:
+        for a in range(s, e - 2, 2):
+            h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
+            c = thumb_call(h1, h2, a)
+            if c and c[0] == "bl":
+                out.add(c[1])
+    return out
+
+
+def pc_relative_literals(t, an):
+    """Literals used as pc-relative offsets: `ldr rX, [pc, #n]` followed within a
+    few instructions by Thumb `add rX, pc` or ARM `add rY, pc, rX` / `add rY, rX, pc`.
+    Returns {literal addr: (anchor addr, pc bias)}; literals seen with more than one
+    anchor are ambiguous and left out."""
+    hw = lambda a: struct.unpack_from("<H", t.blob, a - t.base)[0]
+    seen = {}
+    for s, e in an["thumb"]:
+        for a in range(s, e, 2):
+            h = hw(a)
+            if h & 0xF800 != 0x4800:
+                continue
+            rd = (h >> 8) & 7
+            lit = ((a + 4) & ~3) + (h & 0xFF) * 4
+            for k in range(1, 5):
+                b = a + 2 * k
+                if b >= e or hw(b) & 0xFF00 == 0x4800 | (rd << 8):  # rd reloaded: not ours
+                    break
+                if hw(b) == 0x4478 | rd:
+                    seen.setdefault(lit, set()).add((b, 4))
+                    break
+    for s, e in an["code"]:
+        for a in range(s, e, 4):
+            w = t.w(a)
+            lts = pc_load_targets(w, a)
+            if not lts or (w >> 26) & 3 != 1 or not (w >> 20) & 1:
+                continue
+            rd = (w >> 12) & 0xF
+            for k in range(1, 5):
+                b = a + 4 * k
+                if b >= e:
+                    break
+                x = t.w(b)
+                if pc_load_targets(x, b) and (x >> 12) & 0xF == rd:  # rd reloaded: not ours
+                    break
+                rn, rm = (x >> 16) & 0xF, x & 0xF
+                if x & 0x0FE00010 == 0x00800000 and ((rn == 15 and rm == rd) or (rn == rd and rm == 15)):
+                    seen.setdefault(lts[0], set()).add((b, 8))
+                    break
+    # A literal reused by several `add pc` sites (the compiler compensates the
+    # difference, e.g. `add r1, pc; subs r1, #0x46`) is fine as long as the sites
+    # stay at fixed distances from each other: take the first one.
+    out, ambiguous = {}, []
+    for lit, v in seen.items():
+        anchors = sorted(v)
+        if len(anchors) == 1 or (anchors[-1][0] - anchors[0][0] < 0x100 and
+                                 all(abs(x[0] - lit) < 0x400 for x in anchors)):
+            out[lit] = anchors[0]
+        else:
+            ambiguous.append(lit)
+    return out, sorted(ambiguous)
 
 
 def main():
@@ -108,9 +182,14 @@ def main():
         return tgt
 
     data_targets = set()
+    # linker boundaries: values equal to a segment end are "end of X" symbols, which
+    # the in-image range check would otherwise miss (e.g. SDK startup's end of .bss)
+    boundaries = {t.end: "__text_end", t.bss_end: "__bss_end", (t.bss_end + 0xFFF) & ~0xFFF: "__image_end"}
 
     def word_ref(a, w):
         """Pointer-like literal values in .text become symbols."""
+        if w in boundaries:
+            return ("expr", boundaries[w])
         if not looks_like_pointer(w, t):
             return None
         if t.in_text(w):
@@ -127,27 +206,26 @@ def main():
     code_words = set()
     for s, e in an["code"]:
         code_words.update(range(s, e, 4))
+    thumb_funcs = thumb_entry_points(t, an, names)
     ctors = init_array(t, starts)
-    data_ptrs = {}   # word addr -> ("text", value) | ("data", value)
-    text_labels = set()
+    words = {}
+    boundary_words = {}
     for seg in ("rodata", "data"):
         lo, hi = segs[seg]
         for a in range(lo, hi - 3, 4):
-            if a in ctors:
-                text_labels.add(ctors[a])
-                continue
-            v = struct.unpack_from("<I", t.blob, a - t.base)[0]
-            if not looks_like_pointer(v, t):
-                continue
-            if t.in_text(v):
-                tgt = text_pointer(v)
-                if tgt is None or not (tgt in starts or tgt in code_words or in_thumb(tgt)):
-                    continue
-                data_ptrs[a] = ("text", v)
-                text_labels.add(tgt)
-            elif data_kind(v):
-                data_ptrs[a] = ("data", v)
-                data_targets.add(v)
+            if a not in ctors:
+                words[a] = struct.unpack_from("<I", t.blob, a - t.base)[0]
+                if words[a] in boundaries:
+                    boundary_words[a] = boundaries[words.pop(a)]
+    data_ptrs = {a: p for a, p in classify(
+        words, t, is_func=lambda x: x in starts or x in thumb_funcs, is_code=lambda x: x in code_words,
+        in_thumb=in_thumb).items() if p[0] == "text" or data_kind(p[1])}
+    text_labels = set(ctors.values())
+    for a, (pk, v) in data_ptrs.items():
+        if pk == "text":
+            text_labels.add(v & ~1)
+        else:
+            data_targets.add(v)
 
     # static.crs: exports and the words modules patch in code.bin need stable labels
     crs = Cro(open(os.path.join(ORIG, "rom", "romfs", "static.crs"), "rb").read(), "static.crs")
@@ -158,8 +236,15 @@ def main():
     for name, a in config:
         (text_labels if t.in_text(a) else data_targets).add(a)
 
+    pcrel, ambiguous = pc_relative_literals(t, an)
+    for lit in pcrel:
+        anchor, bias = pcrel[lit]
+        tgt = (t.w(lit) + anchor + bias) & 0xFFFFFFFF
+        if not t.in_text(tgt & ~1):
+            data_targets.add(tgt)
+
     region = Region(t.words, t.base, t.blob[: t.size], kind, sorted(starts), text_names, force_raw, word_ref,
-                    labels=text_labels, thumb=thumb)
+                    labels=text_labels, thumb=thumb, pcrel=pcrel)
     units = region.emit(os.path.join(ROOT, "asm", "text"))
 
     def text_expr(v):
@@ -190,6 +275,9 @@ def main():
             for a, tgt in ctors.items():
                 if lo <= a < hi:
                     words[a - lo] = f"{region.global_name(tgt)} - ."
+            for a, name in boundary_words.items():
+                if lo <= a < hi:
+                    words[a - lo] = name
         for o in labels[k]:
             labels[k][o] = sorted(set(labels[k][o]))
         emit_segment(os.path.join(ROOT, "asm", "data", f"{k}.s"), k, CODE_BIN, lo - t.base, hi - lo,
@@ -202,10 +290,11 @@ def main():
         for s, size, sym in units:
             f.write(f"{s:08X}\t{size}\t{sym}\n")
     layout = ["SECTIONS", "{",
-              f"    .text {t.base:#x} : {{ *(SORT_BY_NAME(.text.*)) }}",
+              f"    .text {t.base:#x} : {{ *(SORT_BY_NAME(.text.*)) __text_end = .; }}",
               "    .rodata ALIGN(0x1000) : { build/data/rodata.o(.rodata) }",
               "    .data ALIGN(0x1000) : { build/data/data.o(.data) }",
-              "    .bss (NOLOAD) : { build/data/bss.o(.bss) }",
+              "    .bss (NOLOAD) : { build/data/bss.o(.bss) __bss_end = .; }",
+              "    __image_end = ALIGN(__bss_end, 0x1000);",
               "    /DISCARD/ : { *(.ARM.attributes) *(.comment) *(.ARM.exidx*) *(.arm_vfe_header) *(.debug*) }",
               "}"]
     open(os.path.join(ROOT, "build", "layout.ld"), "w").write("\n".join(layout) + "\n")
@@ -225,7 +314,9 @@ def main():
 
     print(f"{len(units)} units; merged {getattr(region, 'merged', 0)} shared-pool starts, "
           f"{len(region.thumb_labels)} Thumb labels; data pointers {len(data_ptrs)}, constructors {len(ctors)}, "
-          f"data labels {sum(len(v) for v in labels.values())}; {len(force_raw)} forced raw")
+          f"data labels {sum(len(v) for v in labels.values())}, boundary refs {len(boundary_words)} in data, "
+          f"pc-relative literals {len(pcrel)} ({len(ambiguous)} ambiguous: {[hex(a) for a in ambiguous]}); "
+          f"{len(force_raw)} forced raw")
 
 
 if __name__ == "__main__":

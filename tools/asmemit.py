@@ -34,7 +34,7 @@ PC_REL = re.compile(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]")
 
 class Region:
     def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None, labels=(),
-                 thumb=()):
+                 thumb=(), pcrel=None, data_sym=None):
         self.words, self.base, self.blob, self.kind = words, base, blob, kind
         self.extra_labels = set(labels)  # addresses referenced from outside the region
         self.end = base + 4 * len(words)
@@ -42,6 +42,10 @@ class Region:
         self.names = dict(names or {})
         self.force_raw = set(force_raw)
         self.word_ref = word_ref or (lambda a, w: None)
+        # pc-relative literals: {literal addr: (anchor addr, pc bias)} where the code
+        # does `ldr rX, =lit; add rX, pc` and the literal is target - (anchor + bias)
+        self.pcrel = pcrel or {}
+        self.data_sym = data_sym or (lambda a: f"data_{a:08X}")
         starts = set(starts) | {base}
         for s, e in self.thumb:
             starts -= {a for a in starts if s < a < e}
@@ -129,16 +133,20 @@ class Region:
                 for lt in pc_load_targets(w, a):
                     if self.in_text(lt):
                         ref(a, lt & ~3)
-            elif k in (LIT, JT):
+            elif k in (LIT, JT) and a not in self.pcrel:
                 r = self.word_ref(a, w)
                 if r and r[0] == "text":
                     ref(a, r[1])
+        for lit, (anchor, bias) in self.pcrel.items():
+            tgt = self.pcrel_target(lit)
+            if self.in_text(tgt & ~1):
+                ref(lit, tgt & ~1)
         for s, e in self.thumb:
             for a in range(s, e - 2, 2):
                 c = thumb_call(self.hw(a), self.hw(a + 2), a)
                 if c and self.in_text(c[1]):
                     ref(a, c[1], arm=c[0] == "blx")
-            for a in self._thumb_literals(s, e):
+            for a in self._thumb_literals(s, e) - set(self.pcrel):
                 r = self.word_ref(a, self.w(a))
                 if r and r[0] == "text":
                     ref(a, r[1])
@@ -165,6 +173,7 @@ class Region:
         local, glob, thumb_labels = self._labels()
         self.thumb_labels = thumb_labels
         self._glob = glob
+        self.anchors = {anchor for anchor, _ in self.pcrel.values()}
 
         def sym_for(tgt):
             if self.in_thumb(tgt):
@@ -193,6 +202,20 @@ class Region:
             units.append((s, e - s, sym))
         return units
 
+    def pcrel_target(self, lit):
+        anchor, bias = self.pcrel[lit]
+        return (self.w(lit) + anchor + bias) & 0xFFFFFFFF
+
+    def _pcrel_word(self, a, sym_for):
+        anchor, bias = self.pcrel[a]
+        tgt = self.pcrel_target(a)
+        if self.in_text(tgt & ~1):
+            t = tgt & ~1
+            expr = self.thumb_sym(t) if self.in_thumb(t) else sym_for(t) + (" + 1" if tgt & 1 else "")
+        else:
+            expr = self.data_sym(tgt)
+        return f"    .word {expr} - (pcanchor_{anchor:08X} + {bias}) /* {a:08X} pc-relative */"
+
     def global_name(self, tgt):
         """Global symbol for a text address (valid after emit); KeyError if it has none."""
         if self.in_thumb(tgt):
@@ -207,6 +230,8 @@ class Region:
         raise KeyError(f"no global label at {tgt:#x}")
 
     def _data_word(self, a, w, sym_for):
+        if a in self.pcrel:
+            return self._pcrel_word(a, sym_for)
         r = self.word_ref(a, w)
         if r:
             if r[0] == "text":
@@ -240,6 +265,8 @@ class Region:
                 lines.append(f"glabel loc_{a:08X}")
             elif a in local:
                 lines.append(f".L_{a:08X}:")
+            if a in self.anchors:
+                lines.append(f"pcanchor_{a:08X}:")
             w = self.words[i]
             k = self.kind[i]
             if a in self.force_raw:
@@ -282,6 +309,8 @@ class Region:
             if a in self.thumb_labels or a == s:
                 name = self.thumb_sym(a)
                 lines += [f"    .global {name}", "    .thumb_func", f"{name}:"]
+            if a in self.anchors:
+                lines.append(f"pcanchor_{a:08X}:")
             if a in literals and a % 4 == 0 and a + 4 <= e:
                 lines.append(self._data_word(a, self.w(a), sym_for))
                 a += 4
