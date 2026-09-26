@@ -130,17 +130,38 @@ def thumb_call(h1, h2, a):
     return None
 
 
+def writes_reg(w):
+    """Destination register of a data-processing op or load (None otherwise)."""
+    cls = (w >> 26) & 3
+    if cls == 1:  # LDR/STR: only loads write Rd
+        return (w >> 12) & 0xF if (w >> 20) & 1 else None
+    if cls == 0:
+        if not (w >> 25) & 1 and (w >> 4) & 9 == 9:  # LDRH/STRH/..., multiplies
+            return (w >> 12) & 0xF if (w >> 20) & 1 and (w >> 5) & 3 else None
+        if (w >> 21) & 0xF in (8, 9, 10, 11):  # TST/TEQ/CMP/CMN
+            return None
+        return (w >> 12) & 0xF
+    return None
+
+
 def cmp_bound(t, a):
-    """Find `cmp rX, #imm` shortly before a (jump-table bound)."""
-    for back in range(1, 5):
+    """Find the `cmp rX, #imm` bounding the jump table at a, where rX is the
+    table index (Rm of the dispatch); armcc may schedule several unrelated
+    instructions in between. Gives up if rX is written first."""
+    reg = t.w(a) & 0xF
+    for back in range(1, 9):
         p = a - 4 * back
         if not t.in_text(p):
             break
         w = t.w(p)
-        if w & 0x0FF00000 == 0x03500000:  # CMP imm
+        if w & 0x0FF00000 == 0x03500000 and (w >> 16) & 0xF == reg:  # CMP rX, #imm
             rot = ((w >> 8) & 0xF) * 2
             imm = w & 0xFF
             return ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+        if writes_reg(w) == reg:
+            break  # rX written before any cmp
+        if branch(w, p) or writes_pc(w):
+            break
     return None
 
 
@@ -375,8 +396,8 @@ class Tracer:
 
 def carve_arm_from_thumb(t, tr, regions):
     """ARM code inside the Thumb library regions (ARM-state entry stubs such as
-    `add ip, pc, #1; bx ip`, small ARM helpers): every ARM b/bl target and
-    Thumb BLX target that lands in a Thumb region is ARM code. Trace each one
+    `add ip, pc, #1; bx ip`, small ARM helpers): every ARM b/bl target, Thumb
+    BLX target and ARM push {..., lr} that lands in a Thumb region is ARM code. Trace each one
     as ARM (the words it reaches stop being Thumb) and repeat until stable."""
     carved = 0
     while True:
@@ -388,9 +409,15 @@ def carve_arm_from_thumb(t, tr, regions):
             br = branch(t.words[i], a)
             if br and br[0] != "blx" and tr.idx(br[1]) in tr.thumb:
                 entries.add(br[1])
-        for s, e in regions:
-            for a in range(s, e - 2, 2):
-                if tr.idx(a) not in tr.thumb:
+        for i in tr.thumb:
+            # an ARM push {..., lr}: ARMv6 Thumb has no 32-bit instruction
+            # starting 0xE92D, so this is an ARM function nothing branches to
+            w = tr.words[i]
+            if w & 0xFFFF4000 == 0xE92D4000 or w == 0xE52DE004:
+                entries.add(t.base + 4 * i)
+        for i in sorted(tr.thumb):  # named regions and Thumb found since
+            for a in (t.base + 4 * i, t.base + 4 * i + 2):
+                if not tr.in_text(a + 2):
                     continue
                 h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
                 c = thumb_call(h1, h2, a)
@@ -416,24 +443,56 @@ def carve_arm_from_thumb(t, tr, regions):
         tr.drain()
 
 
-def thumb_from_blx(t, tr):
+def thumb_from_blx(t, tr, pointers=()):
     """Thumb functions outside the named Thumb regions, reached from ARM code by
-    BLX: mark the untraced gap each one sits in as Thumb (so the call and the
-    function get symbols), stopping at the next traced word."""
-    found = 0
+    BLX or by an odd pointer (a vtable slot) to code that opens like a Thumb
+    function: mark the untraced gap each one sits in as Thumb (so the call and
+    the function get symbols), stopping at the next traced word."""
+    targets = []
     for i, w in enumerate(tr.words):
-        if tr.kind[i] != CODE or i in tr.thumb:
+        if tr.kind[i] == CODE and i not in tr.thumb:
+            br = branch(w, tr.base + 4 * i)
+            if br and br[0] == "blx":
+                targets.append(br[1] & ~1)
+    for v in pointers:
+        if v & 1 and tr.in_text(v & ~1) and tr.kind[tr.idx(v & ~3)] == 0:
+            h = struct.unpack_from("<H", t.blob, (v & ~1) - t.base)[0]
+            if h & 0xFF00 == 0xB500 or h == 0x4770:  # push {..., lr} / bx lr
+                targets.append(v & ~1)
+    found = 0
+    for a in targets:
+        if not tr.in_text(a):
             continue
-        br = branch(w, tr.base + 4 * i)
-        if not br or br[0] != "blx" or not tr.in_text(br[1] & ~1):
-            continue
-        j = tr.idx(br[1] & ~3)
+        j = tr.idx(a & ~3)
         if j in tr.thumb or tr.kind[j]:
             continue
         found += 1
         while j < len(tr.words) and not tr.kind[j] and j not in tr.thumb:
             tr.thumb.add(j)
             j += 1
+    return found
+
+
+def thumb_gaps(t, tr):
+    """Unnamed Thumb functions between named ARM ones (static library code):
+    untraced gaps that open with a Thumb push and make a Thumb BL/BLX to a known
+    function or Thumb region. The whole gap becomes Thumb."""
+    known = lambda a: a in tr.funcs or (tr.in_text(a) and tr.idx(a & ~3) in tr.thumb)
+    found, i, n = 0, 0, len(tr.words)
+    while i < n:
+        if tr.kind[i] or i in tr.thumb:
+            i += 1
+            continue
+        j = i
+        while j < n and not tr.kind[j] and j not in tr.thumb:
+            j += 1
+        s = tr.base + 4 * i
+        hw = struct.unpack_from(f"<{2 * (j - i)}H", t.blob, s - t.base)
+        calls = [thumb_call(hw[k], hw[k + 1], s + 2 * k) for k in range(len(hw) - 1)]
+        if any(h & 0xFE00 == 0xB400 for h in hw[:4]) and any(c and known(c[1] & ~1) for c in calls):
+            tr.thumb.update(range(i, j))
+            found += 1
+        i = j
     return found
 
 
@@ -511,13 +570,15 @@ def analyze():
         lit_ptrs += more
         if not more:
             break
+    blx_thumb = thumb_gaps(t, tr)
+    blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
+                               + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
     carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
-    blx_thumb = thumb_from_blx(t, tr)
 
     result = tr.result()
     result["thumb"] = thumb_runs(tr)
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
-    print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx")
+    print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx / odd pointers")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps)")
     print("text " + tr.summary())
