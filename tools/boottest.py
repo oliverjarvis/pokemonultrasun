@@ -37,12 +37,22 @@ def main():
         except ProcessLookupError:
             pass
     bad = []
+    booted = False
+    last = 0.0
     with open(LOG, errors="replace") as f:
         for line in f:
+            booted = booted or "BootGame" in line
+            m = re.match(r"\[\s*([0-9.]+)\]", line)
+            if m:
+                last = float(m.group(1))
             if re.search(r"broke execution|Exception Type|unmapped (Read|Write)", line):
                 bad.append(line.strip())
                 if len(bad) >= 4:
                     break
+    if not bad and (not booted or last < 1.5):
+        # the log ends before the first second or so: the game never really ran
+        print(f"{os.path.basename(rom)}: NOBOOT (log ends at {last:.1f}s)")
+        return 2
     print(f"{os.path.basename(rom)}: {'CRASH' if bad else 'ok'} after {seconds:.0f}s")
     for line in bad:
         print("   ", line[:200])

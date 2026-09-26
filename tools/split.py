@@ -27,7 +27,7 @@ import struct
 from analyze import CODE, JT, LIT, Text, branch, pc_load_targets, thumb_call
 from asmemit import MACROS, Region, emit_segment
 from cro import Cro
-from pointers import classify, looks_like_pointer
+from pointers import ascii_tail, classify, looks_like_pointer, small_pair, utf16_like
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
 ORIG = os.path.join(ROOT, "orig")
@@ -65,6 +65,30 @@ def init_array(t, starts):
         if len(run) >= 16:
             out.update(run)
         run = []
+    return out
+
+
+def extend_literal_pools(kind, max_run=16):
+    """Untraced words in short runs of non-code words that contain a literal
+    are part of that literal pool (e.g. a constant struct whose base is taken
+    with `add rX, pc, #n`); mark them LIT. Returns their addresses."""
+    base = 0x100000
+    out = set()
+    i, n = 0, len(kind)
+    while i < n:
+        if kind[i] == CODE:
+            i += 1
+            continue
+        j = i
+        while j < n and kind[j] != CODE:
+            j += 1
+        run = range(i, j)
+        if j - i <= max_run and any(kind[k] in (LIT, JT) for k in run):
+            for k in run:
+                if kind[k] == 0:
+                    kind[k] = LIT
+                    out.add(base + 4 * k)
+        i = j
     return out
 
 
@@ -162,6 +186,7 @@ def main():
         kind[(a - t.base) >> 2] = JT
     starts = {a for a, _ in an["funcs"]}
     thumb = an["thumb"]
+    pool_words = extend_literal_pools(kind)  # untraced words inside short literal pools
     in_thumb = lambda a: any(ts <= a < te for ts, te in thumb)
 
     segs = {"rodata": t.ro, "data": t.data, "bss": (t.data[1], t.bss_end)}
@@ -182,6 +207,13 @@ def main():
         return tgt
 
     data_targets = set()
+
+    def plausible_pool_pointer(w, a):
+        """Stricter check for pool words nobody loads directly: not text, not a
+        small-number pair."""
+        prev, nxt = t.w(a - 4), t.w(a + 4) if a + 4 < t.end else 0
+        return not (utf16_like(w) or ascii_tail(w) or small_pair(w))
+
     # linker boundaries: values equal to a segment end are "end of X" symbols, which
     # the in-image range check would otherwise miss (e.g. SDK startup's end of .bss)
     boundaries = {t.end: "__text_end", t.bss_end: "__bss_end", (t.bss_end + 0xFFF) & ~0xFFF: "__image_end"}
@@ -190,7 +222,11 @@ def main():
         """Pointer-like literal values in .text become symbols."""
         if w in boundaries:
             return ("expr", boundaries[w])
+        if kind[(a - t.base) >> 2] == JT and t.in_text(w):
+            return ("text", w, "")  # traced case target, even at a round address
         if not looks_like_pointer(w, t):
+            return None
+        if a in pool_words and not plausible_pool_pointer(w, a):
             return None
         if t.in_text(w):
             tgt = text_pointer(w)

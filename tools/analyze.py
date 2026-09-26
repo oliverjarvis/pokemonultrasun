@@ -215,9 +215,12 @@ class Tracer:
                         if cond == AL:
                             break
                 wp = writes_pc(w)
+                # cases 0..bound for `ls` (<=), 0..bound-1 for `lo`/`cc` (<)
+                inclusive = cond != 0x3
                 if wp == "jt_add":
                     bound = cmp_bound(self, a)
-                    count = (bound + 1 if bound is not None else 0) + 1  # default branch + cases
+                    cases = (bound + (1 if inclusive else 0)) if bound is not None else 0
+                    count = cases + 1  # default branch + cases
                     for k2 in range(1, count + 1):
                         e = a + 4 * k2
                         if self.in_text(e) and branch(self.w(e), e):
@@ -229,7 +232,7 @@ class Tracer:
                     if bound is not None:
                         # layout: ldrls pc,[pc,rX,lsl#2]; b default; .word case0..caseN
                         stack.append(a + 4)
-                        for k2 in range(bound + 1):
+                        for k2 in range(bound + (1 if inclusive else 0)):
                             e = a + 8 + 4 * k2
                             if self.in_text(e):
                                 kind[self.idx(e)] = JT
