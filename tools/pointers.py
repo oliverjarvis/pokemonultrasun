@@ -55,12 +55,13 @@ def looks_like_pointer(v, t):
     return in_image(v, t)
 
 
-def classify(words, t, is_func, is_code, in_thumb):
+def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
     """Pointer words in a data segment.
 
     words: {address: value} for every aligned word of .rodata/.data.
     is_func(tgt): tgt is a function start / Thumb function; is_code(tgt): tgt is
-    a traced instruction. Returns {address: ("text" | "data", value)}.
+    a traced instruction; thumb_entry(tgt): the Thumb code at tgt opens like a
+    function (push {..., lr} or bx lr). Returns {address: ("text" | "data", value)}.
 
     Evidence is tiered: a function-start target is only rejected as text or
     inside a table of small 16-bit pairs (both neighbours);
@@ -110,8 +111,11 @@ def classify(words, t, is_func, is_code, in_thumb):
         if t.in_text(v):
             tgt = v & ~1
             if v & 1:
-                if in_thumb(tgt) and is_func(tgt):
-                    out[a] = ("text", v)
+                if in_thumb(tgt):
+                    if is_func(tgt) or thumb_entry(tgt):
+                        out[a] = ("text", v)
+                    else:
+                        pending.append((a, v))  # e.g. a Thumb vtable entry nothing calls directly
             elif tgt % 4 == 0 and not in_thumb(tgt):
                 if is_func(tgt):
                     if not pair_table(a, v, both=True):

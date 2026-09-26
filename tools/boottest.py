@@ -9,6 +9,7 @@ Only one Azahar instance should run meanwhile: they share the log file.
 """
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,6 +53,11 @@ def main():
         except ProcessLookupError:
             pass
     name = os.path.basename(rom)
+    if bad or not booted or last < 1.0:
+        # keep the evidence: the next launch overwrites the log
+        keep = os.path.join(os.path.dirname(rom), "boottest-logs")
+        os.makedirs(keep, exist_ok=True)
+        shutil.copy(LOG, os.path.join(keep, f"{name}.{time.strftime('%H%M%S')}.txt"))
     if not bad and (not booted or last < 1.0):
         # a good boot reaches the game's service setup at ~1.5s, then the log goes quiet
         print(f"{name}: HANG (log stops at {last:.1f}s)")

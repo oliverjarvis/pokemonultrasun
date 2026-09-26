@@ -416,6 +416,27 @@ def carve_arm_from_thumb(t, tr, regions):
         tr.drain()
 
 
+def thumb_from_blx(t, tr):
+    """Thumb functions outside the named Thumb regions, reached from ARM code by
+    BLX: mark the untraced gap each one sits in as Thumb (so the call and the
+    function get symbols), stopping at the next traced word."""
+    found = 0
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] != CODE or i in tr.thumb:
+            continue
+        br = branch(w, tr.base + 4 * i)
+        if not br or br[0] != "blx" or not tr.in_text(br[1] & ~1):
+            continue
+        j = tr.idx(br[1] & ~3)
+        if j in tr.thumb or tr.kind[j]:
+            continue
+        found += 1
+        while j < len(tr.words) and not tr.kind[j] and j not in tr.thumb:
+            tr.thumb.add(j)
+            j += 1
+    return found
+
+
 def thumb_runs(tr):
     """Contiguous [start, end) runs of the remaining Thumb words."""
     out = []
@@ -491,11 +512,12 @@ def analyze():
         if not more:
             break
     carved += carve_arm_from_thumb(t, tr, thumb_regions)  # code found since may branch into Thumb too
+    blx_thumb = thumb_from_blx(t, tr)
 
     result = tr.result()
     result["thumb"] = thumb_runs(tr)
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
-    print(f"carved {carved} ARM entry points out of Thumb regions")
+    print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps)")
     print("text " + tr.summary())

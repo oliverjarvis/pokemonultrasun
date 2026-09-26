@@ -18,7 +18,8 @@ Run tools/configure.py afterwards to (re)generate build.ninja.
 
 Words listed in config/force_raw.txt are emitted as `.inst` (exact bytes,
 no relocation); tools/check.py adds entries when the assembler's encoding
-differs from the original.
+differs from the original. Literal-pool words listed there stay plain numbers
+(values that look like code addresses but aren't, e.g. GPU register offsets).
 """
 import json
 import os
@@ -220,6 +221,8 @@ def main():
 
     def word_ref(a, w):
         """Pointer-like literal values in .text become symbols."""
+        if a in force_raw:
+            return None  # a number that looks like a pointer (config/force_raw.txt)
         if w in boundaries:
             return ("expr", boundaries[w])
         if kind[(a - t.base) >> 2] == JT and t.in_text(w):
@@ -248,6 +251,10 @@ def main():
     for s, e in an["code"]:
         code_words.update(range(s, e, 4))
     thumb_funcs = thumb_entry_points(t, an, names)
+
+    def thumb_entry(a):
+        h = struct.unpack_from("<H", t.blob, a - t.base)[0]
+        return h & 0xFF00 == 0xB500 or h == 0x4770  # push {..., lr} / bx lr
     ctors = init_array(t, starts)
     words = {}
     boundary_words = {}
@@ -260,7 +267,7 @@ def main():
                     boundary_words[a] = boundaries[words.pop(a)]
     data_ptrs = {a: p for a, p in classify(
         words, t, is_func=lambda x: x in starts or x in thumb_funcs, is_code=lambda x: x in code_words,
-        in_thumb=in_thumb).items() if p[0] == "text" or data_kind(p[1])}
+        in_thumb=in_thumb, thumb_entry=thumb_entry).items() if p[0] == "text" or data_kind(p[1])}
     # an unaligned target inside a word that is itself a code pointer (vtable
     # entry, constructor, boundary): the reference is the look-alike, drop it
     # rather than leave the pointer word raw
