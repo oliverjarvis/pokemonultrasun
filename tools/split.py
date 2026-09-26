@@ -115,6 +115,33 @@ def thumb_entry_points(t, an, names):
     return out
 
 
+def ipc_header_literals(t, an):
+    """Literals holding IPC command headers (0x00110080: command 0x11, two
+    words), which collide with code addresses: the value is stored to the
+    command buffer at TLS + 0x80 (`mrc p15, 0, rY, c13, c0, 3` ... `str rX,
+    [rY, #0x80]`) after `ldr rX, =header`."""
+    out = set()
+    for s, e in an["code"]:
+        for a in range(s, e, 4):
+            w = t.w(a)
+            # str rX, [rY, #0x80] (optionally pre-indexed with writeback)
+            if w & 0x0F500FFF != 0x05000080 or not (w >> 24) & 1 or not (w >> 23) & 1:
+                continue
+            rx, ry = (w >> 12) & 0xF, (w >> 16) & 0xF
+            back = [a - 4 * k for k in range(1, 13) if a - 4 * k >= s]
+            if not any(t.w(b) & 0x0FFF0FFF == 0x0E1D0F70 and (t.w(b) >> 12) & 0xF == ry for b in back):
+                continue  # rY isn't the thread-local storage pointer
+            for b in back:
+                x = t.w(b)
+                lts = pc_load_targets(x, b)
+                if lts and (x >> 12) & 0xF == rx and (x >> 20) & 1 and (x >> 26) & 3 == 1:
+                    out.add(lts[0])
+                    break
+                if writes_reg(x) == rx:
+                    break
+    return out
+
+
 def pc_relative_literals(t, an):
     """Literals used as pc-relative offsets: `ldr rX, [pc, #n]` followed within a
     few instructions by Thumb `add rX, pc` or ARM `add rY, pc, rX` / `add rY, rX, pc`.
@@ -228,6 +255,7 @@ def main():
             e = T + 4 * k
             reltab[e] = (T, (T + t.w(e)) & 0xFFFFFFFF)
 
+    ipc_headers = ipc_header_literals(t, an)
     pc_loaded = {lt & ~3 for s_, e_ in an["code"] for x in range(s_, e_, 4) for lt in pc_load_targets(t.w(x), x)}
 
     def word_ref(a, w):
@@ -235,8 +263,8 @@ def main():
         if a in reltab:
             T, tgt = reltab[a]
             return ("rel", tgt, T)
-        if a in force_raw:
-            return None  # a number that looks like a pointer (config/force_raw.txt)
+        if a in force_raw or a in ipc_headers:
+            return None  # a number that looks like a pointer (config/force_raw.txt, IPC header)
         if w in boundaries:
             return ("expr", boundaries[w])
         if kind[(a - t.base) >> 2] == JT and t.in_text(w):

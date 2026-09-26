@@ -55,6 +55,17 @@ def looks_like_pointer(v, t):
     return in_image(v, t)
 
 
+def string_start(t, v, min_len=3):
+    """v starts a NUL-terminated printable ASCII string (after a NUL)."""
+    o = v - t.base
+    if not (t.ro[0] <= v < t.data[1]) or o <= 0 or t.blob[o - 1] != 0:
+        return False
+    n = 0
+    while o + n < len(t.blob) and n < 256 and printable(t.blob[o + n]):
+        n += 1
+    return n >= min_len and o + n < len(t.blob) and t.blob[o + n] == 0
+
+
 def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
     """Pointer words in a data segment.
 
@@ -68,7 +79,8 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
     a function start at a multiple of 0x10000 (usually a size) and
     a mid-function target also need an accepted code pointer within two
     words and must not look like a small-number table; a data target is
-    rejected as text or when both neighbours are small 16-bit pairs.
+    rejected as text or when both neighbours are small 16-bit pairs, unless it
+    starts a string.
     """
     def sibling(n, v):
         """n and v both start functions in the same 64 KB: neighbouring vtable
@@ -124,7 +136,8 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
                         out[a] = ("text", v)
                 elif is_code(tgt) and not pair_table(a, v, both=False):
                     pending.append((a, v))
-        elif not pair_table(a, v, both=True):
+        elif not pair_table(a, v, both=True) or string_start(t, v):
+            # e.g. 0x006500CC -> "ptm:u": a string pointer that looks like a pair
             out[a] = ("data", v)
     for a, v in pending:
         if any(out.get(a + 4 * k, ("",))[0] == "text" for k in (-2, -1, 1, 2)):
