@@ -181,6 +181,7 @@ class Tracer:
         self.end = base + 4 * len(words)
         self.kind = bytearray(len(words))
         self.thumb = set(thumb)
+        self.reltabs = {}  # table address -> entries (offsets from the table)
         self.funcs = {}
         self.work = []
         self.seen = set()
@@ -395,6 +396,7 @@ class Tracer:
             "code": self.runs(CODE),
             "literals": [self.base + 4 * i for i in range(n) if self.kind[i] == LIT],
             "jumptabs": [self.base + 4 * i for i in range(n) if self.kind[i] == JT],
+            "reltabs": {f"{a:#x}": c for a, c in sorted(self.reltabs.items())},
         }
 
     def summary(self):
@@ -403,6 +405,60 @@ class Tracer:
         th = len(self.thumb)
         return (f"words: {n}  code {counts[CODE] / n:.1%}  literal {counts[LIT] / n:.1%}  "
                 f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
+
+
+def relative_tables(t, tr):
+    """Tables of offsets from their own start, used as
+
+        adr   rB, table            (add/sub rB, pc, #imm)
+        ldr   rX, [rB, rI, lsl #2]
+        add   pc, rX, rB           (or add rY, ...; bx rY)
+
+    (armcc's blending kernels). Entries become JT words listed in
+    tr.reltabs {table: count}; their targets are traced as code."""
+    found = 0
+    while True:
+        new = []
+        for i, w in enumerate(tr.words):
+            if tr.kind[i] != CODE or i in tr.thumb:
+                continue
+            a = tr.base + 4 * i
+            if (w >> 25) & 7 != 1 or (w >> 16) & 0xF != 15 or (w >> 21) & 0xF not in (2, 4) or (w >> 20) & 1:
+                continue
+            rot, imm = ((w >> 8) & 0xF) * 2, w & 0xFF
+            v = ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+            T = a + 8 + v if (w >> 21) & 0xF == 4 else a + 8 - v
+            rb = (w >> 12) & 0xF
+            if not tr.in_text(T) or T & 3 or T in tr.reltabs:
+                continue
+            ops = [tr.w(a + 4 * k) for k in range(1, 7) if tr.in_text(a + 4 * k)]
+            ldr = next((x for x in ops if (x >> 25) & 7 == 3 and (x >> 20) & 1 and not (x >> 22) & 1
+                        and (x >> 16) & 0xF == rb and (x >> 4) & 0xFF == 0x10 and not (x >> 21) & 1), None)
+            if ldr is None:
+                continue
+            rx = (ldr >> 12) & 0xF
+            if not any((x >> 25) & 7 == 0 and (x >> 21) & 0xF == 4 and not (x >> 20) & 1 and (x >> 4) & 0xFF == 0
+                       and {(x >> 16) & 0xF, x & 0xF} == {rx, rb} for x in ops):
+                continue
+            n = 0
+            while n < 256 and tr.in_text(T + 4 * n) and tr.kind[tr.idx(T + 4 * n)] != CODE:
+                e = tr.w(T + 4 * n)
+                tgt = (T + e) & 0xFFFFFFFF
+                if not (0 < e < 0x100000 and tr.in_text(tgt) and not tgt & 3):
+                    break
+                n += 1
+            if n:
+                tr.reltabs[T] = n
+                for k in range(n):
+                    tr.kind[tr.idx(T + 4 * k)] = JT
+                    new.append((T + tr.w(T + 4 * k)) & 0xFFFFFFFF)
+        if not new:
+            return found
+        found += len(new)
+        for tgt in new:
+            if tr.kind[tr.idx(tgt)] != CODE:
+                tr.seed(tgt)
+        tr.drain()
 
 
 def carve_arm_from_thumb(t, tr, regions):
@@ -599,6 +655,7 @@ def analyze():
         lit_ptrs += more
         if not more:
             break
+    reltab_targets = relative_tables(t, tr)
     blx_thumb = thumb_gaps(t, tr)
     blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
                                + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
@@ -609,7 +666,8 @@ def analyze():
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
     print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx / odd pointers")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
-          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps)")
+          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps); "
+          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries)")
     print("text " + tr.summary())
 
 

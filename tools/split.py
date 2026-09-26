@@ -219,8 +219,19 @@ def main():
     # the in-image range check would otherwise miss (e.g. SDK startup's end of .bss)
     boundaries = {t.end: "__text_end", t.bss_end: "__bss_end", (t.bss_end + 0xFFF) & ~0xFFF: "__image_end"}
 
+    # tables of offsets from their own start (see analyze.relative_tables)
+    reltab = {}
+    for T, n in an.get("reltabs", {}).items():
+        T = int(T, 16)
+        for k in range(n):
+            e = T + 4 * k
+            reltab[e] = (T, (T + t.w(e)) & 0xFFFFFFFF)
+
     def word_ref(a, w):
         """Pointer-like literal values in .text become symbols."""
+        if a in reltab:
+            T, tgt = reltab[a]
+            return ("rel", tgt, T)
         if a in force_raw:
             return None  # a number that looks like a pointer (config/force_raw.txt)
         if w in boundaries:
@@ -277,7 +288,7 @@ def main():
         return v % 4 != 0 and (v & ~3) in code_ptr_words
 
     data_ptrs = {a: p for a, p in data_ptrs.items() if not (p[0] == "data" and inside_code_ptr(p[1]))}
-    text_labels = set(ctors.values())
+    text_labels = set(ctors.values()) | {x for T, tgt in reltab.values() for x in (T, tgt)}
     for a, (pk, v) in data_ptrs.items():
         if pk == "text":
             text_labels.add(v & ~1)

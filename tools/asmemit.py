@@ -8,6 +8,7 @@ caller's `word_ref(addr, word)` callback, which returns one of:
   None                     keep the raw value
   ("text", target, suffix) reference to a text address in this region
   ("expr", text)           an arbitrary assembler expression
+  ("rel", target, base)    target - base, both text addresses (offset tables)
   ("raw", comment)         keep the raw value, with a trailing comment
 `labels` are addresses that need a global label (referenced from elsewhere).
 
@@ -157,6 +158,9 @@ class Region:
                 r = self.word_ref(a, w)
                 if r and r[0] == "text":
                     ref(a, r[1])
+                elif r and r[0] == "rel":
+                    ref(a, r[1])
+                    ref(a, r[2])
         for lit, (anchor, bias) in self.pcrel.items():
             tgt = self.pcrel_target(lit)
             if self.in_text(tgt & ~1):
@@ -268,6 +272,8 @@ class Region:
                 return f"    .word {sym_for(r[1])}{r[2]} /* {a:08X} */"
             if r[0] == "expr":
                 return f"    .word {r[1]} /* {a:08X} */"
+            if r[0] == "rel":
+                return f"    .word {sym_for(r[1])} - {sym_for(r[2])} /* {a:08X} */"
             if r[0] == "raw":
                 return f"    .word 0x{w:08x} /* {a:08X} {r[1]} */"
         return f"    .word 0x{w:08x} /* {a:08X} */"
