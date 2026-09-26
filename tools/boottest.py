@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Boot a ROM in Azahar for a few seconds and report whether it crashed.
 
-  boottest.py ROM.3ds [seconds]
+  boottest.py ROM.3ds [seconds] [movie.ctm]
+
+With a movie (recorded with `azahar -r`), the recorded button presses are
+replayed, e.g. title -> Continue -> overworld, to reach code a plain boot
+doesn't run.
 
 Opens the ROM with Azahar.app (its window appears), quits it cleanly so the log is
 flushed, then scans Azahar's log for a panic (svcBreak) or CPU exception.
@@ -27,10 +31,11 @@ def running(rom):
 def main():
     rom = os.path.abspath(sys.argv[1])
     seconds = float(sys.argv[2]) if len(sys.argv) > 2 else 8
+    movie = ["-p", os.path.abspath(sys.argv[3])] if len(sys.argv) > 3 else []
     before = running(rom)  # never touch an instance someone else is playing
     # launch through the app bundle: running the executable directly shows a modal
     # warning that can hold up emulation
-    subprocess.run(["open", "-n", "-a", APP, "--args", rom], check=True)
+    subprocess.run(["open", "-n", "-a", APP, "--args", *movie, rom], check=True)
     time.sleep(seconds)
     # read the log while the emulator still runs: Azahar writes it as it goes, but
     # a hung game won't quit on SIGTERM and killing it loses whatever is unflushed

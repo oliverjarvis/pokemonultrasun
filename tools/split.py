@@ -115,6 +115,26 @@ def thumb_entry_points(t, an, names):
     return out
 
 
+def halfword_pair_tables(t, min_pairs=3):
+    """{addr: (name, function)} for tables of {char *name, function} pairs at
+    offsets that are 2 mod 4 in .rodata/.data. Names may point into the middle
+    of a string (the linker shares string tails)."""
+    w = lambda a: struct.unpack_from("<I", t.blob, a - t.base)[0]
+    ok = lambda a: t.ro[0] <= w(a) < t.data[1] and t.in_text(w(a + 4) & ~1)
+    out = {}
+    for lo, hi in (t.ro, t.data):
+        a = lo + 2
+        while a < hi - 8:
+            s = a
+            while a < hi - 8 and ok(a):
+                a += 8
+            if (a - s) // 8 >= min_pairs:
+                for x in range(s, a, 8):
+                    out[x] = (w(x), w(x + 4))
+            a = a + 4 if a == s else a
+    return out
+
+
 def ipc_header_literals(t, an):
     """Literals holding IPC command headers (0x00110080: command 0x11, two
     words), which collide with code addresses: the value is stored to the
@@ -316,6 +336,15 @@ def main():
     data_ptrs = {a: p for a, p in classify(
         words, t, is_func=lambda x: x in starts or x in thumb_funcs, is_code=lambda x: x in code_words,
         in_thumb=in_thumb, thumb_entry=thumb_entry).items() if p[0] == "text" or data_kind(p[1])}
+    # {name, function} tables at 2-byte-aligned offsets (the field scripts' 156
+    # AMX natives at 0x5E7192 follow a u16 table): word scans never see them
+    for a, (name, func) in halfword_pair_tables(t).items():
+        if text_pointer(func) is None or not data_kind(name):
+            continue
+        for x in (a - 2, a + 2, a + 6):
+            data_ptrs.pop(x, None)  # aligned look-alikes straddling the pair
+        data_ptrs[a] = ("data", name)
+        data_ptrs[a + 4] = ("text", func)
     # an unaligned target inside a word that is itself a pointer (vtable entry,
     # typeinfo, string table entry, constructor, boundary): the reference is the
     # look-alike, drop it rather than leave the pointer word raw
