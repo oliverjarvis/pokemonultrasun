@@ -25,7 +25,7 @@ import json
 import os
 import struct
 
-from analyze import CODE, JT, LIT, Text, branch, pc_load_targets, thumb_call
+from analyze import CODE, JT, LIT, Text, branch, pc_load_targets, thumb_call, writes_pc, writes_reg
 from asmemit import MACROS, Region, emit_segment
 from cro import Cro
 from pointers import ascii_tail, classify, looks_like_pointer, small_pair, utf16_like
@@ -142,16 +142,16 @@ def pc_relative_literals(t, an):
             if not lts or (w >> 26) & 3 != 1 or not (w >> 20) & 1:
                 continue
             rd = (w >> 12) & 0xF
-            for k in range(1, 5):
+            for k in range(1, 25):  # armcc may schedule the add well after the load
                 b = a + 4 * k
                 if b >= e:
                     break
                 x = t.w(b)
-                if pc_load_targets(x, b) and (x >> 12) & 0xF == rd:  # rd reloaded: not ours
-                    break
                 rn, rm = (x >> 16) & 0xF, x & 0xF
                 if x & 0x0FE00010 == 0x00800000 and ((rn == 15 and rm == rd) or (rn == rd and rm == 15)):
                     seen.setdefault(lts[0], set()).add((b, 8))
+                    break
+                if writes_reg(x) == rd or branch(x, b) or writes_pc(x):  # rd replaced / control leaves
                     break
     # A literal reused by several `add pc` sites (the compiler compensates the
     # difference, e.g. `add r1, pc; subs r1, #0x46`) is fine as long as the sites

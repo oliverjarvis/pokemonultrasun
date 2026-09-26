@@ -411,7 +411,8 @@ def relative_tables(t, tr):
     """Tables of offsets from their own start, used as
 
         adr   rB, table            (add/sub rB, pc, #imm)
-        ldr   rX, [rB, rI, lsl #2]
+        ldr   rX, [rB, rI(, lsl #2)]
+        (offsets may be negative)
         add   pc, rX, rB           (or add rY, ...; bx rY)
 
     (armcc's blending kernels). Entries become JT words listed in
@@ -431,9 +432,9 @@ def relative_tables(t, tr):
             rb = (w >> 12) & 0xF
             if not tr.in_text(T) or T & 3 or T in tr.reltabs:
                 continue
-            ops = [tr.w(a + 4 * k) for k in range(1, 7) if tr.in_text(a + 4 * k)]
+            ops = [tr.w(a + 4 * k) for k in range(1, 13) if tr.in_text(a + 4 * k)]
             ldr = next((x for x in ops if (x >> 25) & 7 == 3 and (x >> 20) & 1 and not (x >> 22) & 1
-                        and (x >> 16) & 0xF == rb and (x >> 4) & 0xFF == 0x10 and not (x >> 21) & 1), None)
+                        and (x >> 16) & 0xF == rb and not (x >> 4) & 1 and not (x >> 21) & 1), None)
             if ldr is None:
                 continue
             rx = (ldr >> 12) & 0xF
@@ -442,9 +443,9 @@ def relative_tables(t, tr):
                 continue
             n = 0
             while n < 256 and tr.in_text(T + 4 * n) and tr.kind[tr.idx(T + 4 * n)] != CODE:
-                e = tr.w(T + 4 * n)
+                e = sext(tr.w(T + 4 * n), 32)
                 tgt = (T + e) & 0xFFFFFFFF
-                if not (0 < e < 0x100000 and tr.in_text(tgt) and not tgt & 3):
+                if not (0 < abs(e) < 0x100000 and tr.in_text(tgt) and not tgt & 3):
                     break
                 n += 1
             if n:
