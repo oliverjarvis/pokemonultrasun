@@ -244,8 +244,12 @@ def main():
         return not (utf16_like(w) or ascii_tail(w) or small_pair(w))
 
     # linker boundaries: values equal to a segment end are "end of X" symbols, which
-    # the in-image range check would otherwise miss (e.g. SDK startup's end of .bss)
-    boundaries = {t.end: "__text_end", t.bss_end: "__bss_end", (t.bss_end + 0xFFF) & ~0xFFF: "__image_end"}
+    # the in-image range check would otherwise miss (e.g. SDK startup's end of .bss),
+    # plus the size of .text
+    boundaries = {t.end: "__text_end", t.bss_end: "__bss_end", (t.bss_end + 0xFFF) & ~0xFFF: "__image_end",
+                  # the SDK's code-size getter (0x104BC4) returns .text's size as a literal;
+                  # the heap budget and an "address is in code" check use it
+                  t.end - t.base: f"__text_end - {t.base:#x}"}
 
     # tables of offsets from their own start (see analyze.relative_tables)
     reltab = {}
