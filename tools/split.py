@@ -53,14 +53,15 @@ def load_config_symbols():
     return out
 
 
-def init_array(t, starts):
-    """Place-relative static-constructor table(s) in .rodata: {word addr: target}."""
+def init_array(t, starts, in_thumb=lambda a: False):
+    """Place-relative static-constructor table(s) in .rodata: {word addr: target}.
+    Thumb constructors (the C library's) have odd targets."""
     ro = t.blob[t.ro_off : t.ro_off + (t.ro[1] - t.ro[0]) // 4 * 4]
     out, run = {}, []
     for k, v in enumerate(struct.unpack(f"<{len(ro) // 4}I", ro) + (0,)):
         a = t.ro[0] + 4 * k
         tgt = (a + v) & 0xFFFFFFFF
-        if k < len(ro) // 4 and tgt in starts:
+        if k < len(ro) // 4 and (tgt in starts or (tgt & 1 and in_thumb(tgt & ~1))):
             run.append((a, tgt))
             continue
         if len(run) >= 16:
@@ -227,6 +228,8 @@ def main():
             e = T + 4 * k
             reltab[e] = (T, (T + t.w(e)) & 0xFFFFFFFF)
 
+    pc_loaded = {lt & ~3 for s_, e_ in an["code"] for x in range(s_, e_, 4) for lt in pc_load_targets(t.w(x), x)}
+
     def word_ref(a, w):
         """Pointer-like literal values in .text become symbols."""
         if a in reltab:
@@ -246,10 +249,12 @@ def main():
             tgt = text_pointer(w)
             if tgt is None:
                 return None
-            if (kind[(tgt - t.base) >> 2] in (CODE, LIT) and tgt not in starts and tgt not in thumb_funcs
-                    and tgt not in text_labels):
-                # the middle of a function or its literal pool: a number (3600000,
-                # a heap size 0x425000)
+            k = kind[(tgt - t.base) >> 2]
+            if ((k == CODE or (k == LIT and tgt in pc_loaded)) and tgt not in starts
+                    and tgt not in thumb_funcs and tgt not in text_labels):
+                # the middle of a function or an entry of its literal pool: a
+                # number (3600000, a heap size 0x425000). A literal-looking word
+                # nothing loads directly (a function-pointer variable) is fine.
                 return None
             return ("text", tgt, " + 1" if w & 1 and not in_thumb(tgt) else "")
         if data_kind(w) is None or inside_code_ptr(w):
@@ -266,7 +271,7 @@ def main():
     def thumb_entry(a):
         h = struct.unpack_from("<H", t.blob, a - t.base)[0]
         return h & 0xFF00 == 0xB500 or h == 0x4770  # push {..., lr} / bx lr
-    ctors = init_array(t, starts)
+    ctors = init_array(t, starts, in_thumb)
     words = {}
     boundary_words = {}
     for seg in ("rodata", "data"):
@@ -288,7 +293,7 @@ def main():
         return v % 4 != 0 and (v & ~3) in code_ptr_words
 
     data_ptrs = {a: p for a, p in data_ptrs.items() if not (p[0] == "data" and inside_code_ptr(p[1]))}
-    text_labels = set(ctors.values()) | {x for T, tgt in reltab.values() for x in (T, tgt)}
+    text_labels = {v & ~1 for v in ctors.values()} | {x for T, tgt in reltab.values() for x in (T, tgt)}
     for a, (pk, v) in data_ptrs.items():
         if pk == "text":
             text_labels.add(v & ~1)
@@ -342,7 +347,8 @@ def main():
                     words[a - lo] = text_expr(v) if pk == "text" else f"data_{v:08X}"
             for a, tgt in ctors.items():
                 if lo <= a < hi:
-                    words[a - lo] = f"{region.global_name(tgt)} - ."
+                    # a Thumb symbol carries bit 0 through R_ARM_REL32
+                    words[a - lo] = f"{region.global_name(tgt & ~1)} - ."
             for a, name in boundary_words.items():
                 if lo <= a < hi:
                     words[a - lo] = name
