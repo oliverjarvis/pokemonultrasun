@@ -445,8 +445,8 @@ def carve_arm_from_thumb(t, tr, regions):
 
 def thumb_from_blx(t, tr, pointers=()):
     """Thumb functions outside the named Thumb regions, reached from ARM code by
-    BLX or by an odd pointer (a vtable slot) to code that opens like a Thumb
-    function: mark the untraced gap each one sits in as Thumb (so the call and
+    BLX, by Thumb BL from Thumb code, or by an odd pointer (a vtable slot) to
+    code that opens like a Thumb function: mark the untraced gap each one sits in as Thumb (so the call and
     the function get symbols), stopping at the next traced word."""
     targets = []
     for i, w in enumerate(tr.words):
@@ -454,22 +454,40 @@ def thumb_from_blx(t, tr, pointers=()):
             br = branch(w, tr.base + 4 * i)
             if br and br[0] == "blx":
                 targets.append(br[1] & ~1)
+    for i in sorted(tr.thumb):  # Thumb BL from known Thumb code
+        for a in (tr.base + 4 * i, tr.base + 4 * i + 2):
+            if tr.in_text(a + 2):
+                h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
+                c = thumb_call(h1, h2, a)
+                if c and c[0] == "bl":
+                    targets.append(c[1])
     for v in pointers:
         if v & 1 and tr.in_text(v & ~1) and tr.kind[tr.idx(v & ~3)] == 0:
             h = struct.unpack_from("<H", t.blob, (v & ~1) - t.base)[0]
             if h & 0xFF00 == 0xB500 or h == 0x4770:  # push {..., lr} / bx lr
                 targets.append(v & ~1)
     found = 0
-    for a in targets:
-        if not tr.in_text(a):
-            continue
-        j = tr.idx(a & ~3)
-        if j in tr.thumb or tr.kind[j]:
-            continue
-        found += 1
-        while j < len(tr.words) and not tr.kind[j] and j not in tr.thumb:
-            tr.thumb.add(j)
-            j += 1
+    while targets:
+        new = []
+        for a in targets:
+            if not tr.in_text(a):
+                continue
+            j = tr.idx(a & ~3)
+            if j in tr.thumb or tr.kind[j]:
+                continue
+            found += 1
+            k = j
+            while k < len(tr.words) and not tr.kind[k] and k not in tr.thumb:
+                tr.thumb.add(k)
+                k += 1
+            # Thumb BL from the new code reaches more Thumb
+            s = tr.base + 4 * j
+            hw = struct.unpack_from(f"<{2 * (k - j)}H", t.blob, s - t.base)
+            for m in range(len(hw) - 1):
+                c = thumb_call(hw[m], hw[m + 1], s + 2 * m)
+                if c and c[0] == "bl":
+                    new.append(c[1])
+        targets = new
     return found
 
 
