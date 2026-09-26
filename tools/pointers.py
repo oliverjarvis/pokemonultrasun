@@ -74,7 +74,9 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
         """n and v both start functions in the same 64 KB: neighbouring vtable
         entries (0x003C0038, 0x003C0054), which look like UTF-16 text or
         small-number pairs themselves, so they don't count as such evidence."""
-        return v & 3 == 0 and n & 3 == 0 and n >> 16 == v >> 16 and is_func(v) and is_func(n)
+        # distinct functions: a run of one repeated value is a number table
+        return (n != v and v & 3 == 0 and n & 3 == 0 and n >> 16 == v >> 16
+                and is_func(v) and is_func(n))
 
     def text(a, v):
         prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
@@ -92,8 +94,8 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
         0x00110020, 0x00120098 at a fixed stride): an index, not an address."""
         def fits(k, s):
             w = words.get(a + k * s)
-            return w is not None and w & 0xFFFF < 0x100 and (w >> 16) == (v >> 16) + k
-        if v & 0xFFFF >= 0x100:
+            return w is not None and w & 0xFFFF < 0x1000 and (w >> 16) == (v >> 16) + k
+        if v & 0xFFFF >= 0x1000:
             return False
         return any((fits(-1, s) and fits(1, s)) or (fits(1, s) and fits(2, s)) or (fits(-1, s) and fits(-2, s))
                    for s in (4, 8, 12, 16))

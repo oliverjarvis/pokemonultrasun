@@ -66,7 +66,8 @@ def main():
         "  command = ld.lld -T build/link.ld -o $out @build/objs.rsp",
         "  description = LD $out",
         "rule bin",
-        "  command = arm-none-eabi-objcopy -O binary $in $out && python3 tools/pad.py $out",
+        "  command = arm-none-eabi-objcopy -O binary $in $out && $PYTHON tools/canon_imm.py $in $out"
+        " && python3 tools/pad.py $out",
         "  description = OBJCOPY $out",
         "rule ldcro",
         "  command = ld.lld --emit-relocs -T $script -o $out @$rsp",
@@ -168,7 +169,7 @@ def main():
         "--out build/link.ld --rsp build/objs.rsp --extra build/data/rodata.o --extra build/data/data.o "
         "--extra build/data/bss.o",
         f"build build/code.elf: ld build/data/rodata.o build/data/data.o build/data/bss.o {' '.join(asm_objs + lnk_objs)} | build/link.ld build/objs.rsp",
-        "build build/code.bin: bin build/code.elf",
+        "build build/code.bin: bin build/code.elf | tools/canon_imm.py",
         f"build build/romfs.bin: romfs | tools/ctr.py {' '.join(romfs_files + overlay_cros)}",
         f"build build/rom.3ds: rom build/code.bin build/romfs.bin | build/code.elf tools/mkrom.py tools/ctr.py {' '.join(rom_parts)}",
         "default build/rom.3ds",

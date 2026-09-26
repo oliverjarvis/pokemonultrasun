@@ -32,6 +32,18 @@ from analyze import CODE, JT, LIT, branch, pc_load_targets, thumb_call
 PC_REL = re.compile(r"\[pc, #(-?0x[0-9a-f]+|-?\d+)\]")
 
 
+def adr_target(w, a):
+    """Address formed by `add/sub rd, pc, #imm` (ADR) at a, or None."""
+    if (w >> 25) & 7 != 0b001 or (w >> 16) & 0xF != 15 or (w >> 20) & 1 or (w >> 12) & 0xF == 15:
+        return None
+    op = (w >> 21) & 0xF
+    if op not in (2, 4) or w >> 28 == 0xF:  # SUB / ADD
+        return None
+    rot, imm = ((w >> 8) & 0xF) * 2, w & 0xFF
+    v = ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+    return (a + 8 + v if op == 4 else a + 8 - v) & 0xFFFFFFFF
+
+
 class Region:
     def __init__(self, words, base, blob, kind, starts, names=None, force_raw=(), word_ref=None, labels=(),
                  thumb=(), pcrel=None, data_sym=None):
@@ -133,6 +145,9 @@ class Region:
                 for lt in pc_load_targets(w, a):
                     if self.in_text(lt):
                         ref(a, lt & ~3)
+                t = self.adr_ok(w, a)
+                if t is not None:
+                    ref(a, t & ~1 if t & 1 else t & ~3)
             elif k in (LIT, JT) and a not in self.pcrel:
                 r = self.word_ref(a, w)
                 if r and r[0] == "text":
@@ -155,6 +170,14 @@ class Region:
         thumb_labels |= {a for a in self.extra_labels if self.in_thumb(a)}
         local -= glob
         return local, glob, thumb_labels
+
+    def adr_ok(self, w, a):
+        """ADR target that can take a symbol: Thumb code (odd) or anything else
+        in text outside the Thumb regions (even)."""
+        t = adr_target(w, a)
+        if t is None or not self.in_text(t & ~1):
+            return None
+        return t if bool(t & 1) == self.in_thumb(t & ~1) else None
 
     def _thumb_literals(self, s, e):
         """Addresses of literal-pool words used by Thumb `ldr rX, [pc, #imm]` in [s, e)."""
@@ -281,6 +304,15 @@ class Region:
                         lines.append(f"    .inst 0x{w:08x} /* {a:08X} {mnem} */")
                         continue
                     op = sym_for(tgt)
+                elif (t := self.adr_ok(w, a)) is not None and self.unit_of(t & ~1) != ui:
+                    # ADR into another unit: let the linker fill in the offset
+                    rd = op.split(",")[0]
+                    tgt = sym_for(t & ~1) if t & 1 else sym_for(t & ~3) + (f" + {t & 3}" if t & 3 else "")
+                    # adrfix_*: tools/canon_imm.py re-encodes the linked immediate the
+                    # way armcc does (smallest rotation); lld picks another rotation
+                    lines.append(f"adrfix_{a:08X}:")
+                    lines.append(f"    add{mnem[3:]} {rd}, pc, #:pc_g0:({tgt} - 8) /* {a:08X} {mnem} */")
+                    continue
                 else:
                     m = PC_REL.search(op)
                     if m and pc_load_targets(w, a):

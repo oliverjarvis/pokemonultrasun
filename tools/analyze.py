@@ -250,6 +250,17 @@ class Tracer:
                         break
                 elif wp == "jt_ldr":
                     bound = cmp_bound(self, a)
+                    if bound is None:
+                        # no cmp in reach: the table of absolute addresses ends at
+                        # the first word that isn't an aligned address near here
+                        bound, inclusive = 0, False
+                        while bound < 256:
+                            e = a + 8 + 4 * bound
+                            v = self.w(e) if self.in_text(e) else 0
+                            if not (self.in_text(v) and v & 3 == 0 and abs(v - a) < 0x10000):
+                                break
+                            bound += 1
+                        bound = bound or None
                     if bound is not None:
                         # layout: ldrls pc,[pc,rX,lsl#2]; b default; .word case0..caseN
                         stack.append(a + 4)
