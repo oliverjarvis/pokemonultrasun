@@ -407,6 +407,27 @@ class Tracer:
                 f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
 
 
+def pointer_pairs(t, tr):
+    """Untraced words in .text holding function starts, next to another one or
+    right after a return (Mobiclip's per-format function-pointer pairs): they
+    become literals so they get symbols. UTF-16 look-alikes and round values
+    are left alone."""
+    from pointers import utf16_like
+    ok = lambda v: v in tr.funcs and not utf16_like(v) and v % 0x10000
+    found = []
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] or i in tr.thumb or not ok(w):
+            continue
+        a = tr.base + 4 * i
+        prev = tr.words[i - 1] if i else 0
+        nxt = tr.words[i + 1] if i + 1 < len(tr.words) else 0
+        if ok(prev) or ok(nxt) or (i and tr.kind[i - 1] == CODE and writes_pc(prev) == "ret"):
+            found.append(i)
+    for i in found:
+        tr.kind[i] = LIT
+    return len(found)
+
+
 def entry_stubs(t, tr):
     """Code-module headers embedded in .text (the blending kernels): a link word
     pointing at another header's entry, `b entry`, a size and a tag. An untraced
@@ -658,7 +679,13 @@ def analyze():
     lit_ptrs = tr.pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT)
     ro = t.blob[t.ro_off : t.ro_off + (t.ro[1] - t.ro[0]) // 4 * 4]
     da = t.blob[t.data_off : t.data_off + (t.data[1] - t.data[0]) // 4 * 4]
-    data_ptrs = tr.pointer_seeds(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
+    from pointers import utf16_like
+    dwords = struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)
+    # UTF-16 text ("40" = 0x00300034) is not a pointer: skip look-alikes with a
+    # look-alike neighbour, as pointers.classify does
+    data_ptrs = tr.pointer_seeds(v for k, v in enumerate(dwords)
+                                 if not (utf16_like(v) and ((k and utf16_like(dwords[k - 1]))
+                                                            or (k + 1 < len(dwords) and utf16_like(dwords[k + 1])))))
 
     # .init_array: armcc emits static-constructor tables as place-relative
     # offsets. Find long runs of rodata words where (address + word) is code.
@@ -686,6 +713,7 @@ def analyze():
             break
     reltab_targets = relative_tables(t, tr)
     stubs = entry_stubs(t, tr)
+    stubs += pointer_pairs(t, tr)
     blx_thumb = thumb_gaps(t, tr)
     blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
                                + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
@@ -698,7 +726,7 @@ def analyze():
     print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx / odd pointers")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
           f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps); "
-          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries), {stubs} module entry stubs")
+          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries), {stubs} module entry stubs / pointer pairs")
     print("text " + tr.summary())
 
 

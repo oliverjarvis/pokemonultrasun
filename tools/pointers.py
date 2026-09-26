@@ -90,10 +90,31 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
         return (n != v and v & 3 == 0 and n & 3 == 0 and n >> 16 == v >> 16
                 and is_func(v) and is_func(n))
 
+    def straddles_string(a, v):
+        """v continues an ASCII string that began in the previous word: "b" +
+        "ool\0" (0x006C6F6F after a word ending in 'b')."""
+        prev = words.get(a - 4, 0)
+        bs = v.to_bytes(4, "little")
+        if not printable(prev >> 24) or not printable(bs[0]):
+            return False
+        k = 0
+        while k < 4 and printable(bs[k]):
+            k += 1
+        if not (k == 4 or bs[k] == 0):
+            return False
+        # a function pointer that merely looks like text: keep it when another
+        # function pointer (not itself text-like) sits within two words
+        if is_func(v & ~1):
+            for d in (-2, -1, 1, 2):
+                n = words.get(a + 4 * d, 0)
+                if n != v and is_func(n & ~1) and not printable(words.get(a + 4 * d - 4, 0) >> 24):
+                    return False
+        return True
+
     def text(a, v):
         prev, nxt = words.get(a - 4, 0), words.get(a + 4, 0)
         return ((utf16_like(v) and any(utf16_like(n) and not sibling(n, v) for n in (prev, nxt)))
-                or (ascii_tail(v) and ascii_word(prev)))
+                or (ascii_tail(v) and ascii_word(prev)) or straddles_string(a, v))
 
     def pair_table(a, v, both):
         if not small_pair(v):
@@ -136,10 +157,17 @@ def classify(words, t, is_func, is_code, in_thumb, thumb_entry=lambda a: False):
                         out[a] = ("text", v)
                 elif is_code(tgt) and not pair_table(a, v, both=False):
                     pending.append((a, v))
+        elif t.ro[0] <= a < t.ro[1] and v >= t.data[1]:
+            # constant data pointing at a zero-initialised global is rare and
+            # numbers land there by chance (DER certificate bytes 0x006B0300):
+            # only with a pointer next to it
+            pending.append((a, v))
         elif not pair_table(a, v, both=True) or string_start(t, v):
             # e.g. 0x006500CC -> "ptm:u": a string pointer that looks like a pair
             out[a] = ("data", v)
     for a, v in pending:
-        if any(out.get(a + 4 * k, ("",))[0] == "text" for k in (-2, -1, 1, 2)):
+        if t.in_text(v) and any(out.get(a + 4 * k, ("",))[0] == "text" for k in (-2, -1, 1, 2)):
             out[a] = ("text", v)
+        elif not t.in_text(v) and any(a + 4 * k in out for k in (-1, 1)):
+            out[a] = ("data", v)
     return out
