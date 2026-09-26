@@ -32,7 +32,7 @@ import struct
 import sys
 
 from analyze import Tracer
-from asmemit import MACROS, Region
+from asmemit import MACROS, Region, emit_segment
 from cro import Cro, cstr
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -170,28 +170,6 @@ def data_alignment(c):
 
 def expr(sym, addend):
     return sym + (f" + {addend}" if addend > 0 else f" - {-addend}" if addend < 0 else "")
-
-
-def emit_segment(path, kind, module_file, file_off, size, labels, words):
-    """Assembly for a non-text segment: original bytes, labels, symbolic words.
-
-    labels: offset -> [names]; words: offset -> assembler expression."""
-    lines = [".include \"macros.inc\"", f".section .{kind}, \"{'aw' if kind != 'rodata' else 'a'}\"" +
-             (", %nobits" if kind == "bss" else ""), ""]
-    cuts = sorted({0, size} | set(labels) | set(words) | {o + 4 for o in words})
-    for a, b in zip(cuts, cuts[1:] + [None]):
-        for name in labels.get(a, []):
-            lines.append(f"dlabel {name}")
-        if b is None:
-            break
-        if a in words:
-            lines.append(f"    .4byte {words[a]} /* {a:08X} */")
-        elif kind == "bss":
-            lines.append(f"    .space {b - a:#x}")
-        else:
-            lines.append(f"    .incbin \"{module_file}\", {file_off + a:#x}, {b - a:#x}")
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
 
 
 def split_module(path, static_syms, incoming=()):

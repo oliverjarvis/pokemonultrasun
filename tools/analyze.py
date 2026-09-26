@@ -42,6 +42,7 @@ class Text:
         self.data = (ex["data"]["addr"], ex["data"]["addr"] + ex["data"]["size"])
         self.ro_off = ex["rodata"]["addr"] - self.base
         self.data_off = ex["data"]["addr"] - self.base
+        self.bss_end = self.data[1] + ex["bss_size"]
 
     def w(self, a):
         return self.words[(a - self.base) >> 2]
@@ -113,17 +114,54 @@ def writes_pc(w):
     return None
 
 
+def sext(v, bits):
+    return v - (1 << bits) if v & (1 << (bits - 1)) else v
+
+
+def thumb_call(h1, h2, a):
+    """Decode a Thumb-1 BL/BLX pair at a: ("bl"|"blx", target) or None."""
+    if h1 & 0xF800 != 0xF000:
+        return None
+    off = sext(((h1 & 0x7FF) << 12) | ((h2 & 0x7FF) << 1), 23)
+    if h2 & 0xF800 == 0xF800:
+        return ("bl", a + 4 + off)
+    if h2 & 0xF800 == 0xE800:
+        return ("blx", (a + 4 + off) & ~3)
+    return None
+
+
+def writes_reg(w):
+    """Destination register of a data-processing op or load (None otherwise)."""
+    cls = (w >> 26) & 3
+    if cls == 1:  # LDR/STR: only loads write Rd
+        return (w >> 12) & 0xF if (w >> 20) & 1 else None
+    if cls == 0:
+        if not (w >> 25) & 1 and (w >> 4) & 9 == 9:  # LDRH/STRH/..., multiplies
+            return (w >> 12) & 0xF if (w >> 20) & 1 and (w >> 5) & 3 else None
+        if (w >> 21) & 0xF in (8, 9, 10, 11):  # TST/TEQ/CMP/CMN
+            return None
+        return (w >> 12) & 0xF
+    return None
+
+
 def cmp_bound(t, a):
-    """Find `cmp rX, #imm` shortly before a (jump-table bound)."""
-    for back in range(1, 5):
+    """Find the `cmp rX, #imm` bounding the jump table at a, where rX is the
+    table index (Rm of the dispatch); armcc may schedule several unrelated
+    instructions in between. Gives up if rX is written first."""
+    reg = t.w(a) & 0xF
+    for back in range(1, 9):
         p = a - 4 * back
         if not t.in_text(p):
             break
         w = t.w(p)
-        if w & 0x0FF00000 == 0x03500000:  # CMP imm
+        if w & 0x0FF00000 == 0x03500000 and (w >> 16) & 0xF == reg:  # CMP rX, #imm
             rot = ((w >> 8) & 0xF) * 2
             imm = w & 0xFF
             return ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+        if writes_reg(w) == reg:
+            break  # rX written before any cmp
+        if branch(w, p) or writes_pc(w):
+            break
     return None
 
 
@@ -143,6 +181,7 @@ class Tracer:
         self.end = base + 4 * len(words)
         self.kind = bytearray(len(words))
         self.thumb = set(thumb)
+        self.reltabs = {}  # table address -> entries (offsets from the table)
         self.funcs = {}
         self.work = []
         self.seen = set()
@@ -198,9 +237,12 @@ class Tracer:
                         if cond == AL:
                             break
                 wp = writes_pc(w)
+                # cases 0..bound for `ls` (<=), 0..bound-1 for `lo`/`cc` (<)
+                inclusive = cond != 0x3
                 if wp == "jt_add":
                     bound = cmp_bound(self, a)
-                    count = (bound + 1 if bound is not None else 0) + 1  # default branch + cases
+                    cases = (bound + (1 if inclusive else 0)) if bound is not None else 0
+                    count = cases + 1  # default branch + cases
                     for k2 in range(1, count + 1):
                         e = a + 4 * k2
                         if self.in_text(e) and branch(self.w(e), e):
@@ -209,10 +251,21 @@ class Tracer:
                         break
                 elif wp == "jt_ldr":
                     bound = cmp_bound(self, a)
+                    if bound is None:
+                        # no cmp in reach: the table of absolute addresses ends at
+                        # the first word that isn't an aligned address near here
+                        bound, inclusive = 0, False
+                        while bound < 256:
+                            e = a + 8 + 4 * bound
+                            v = self.w(e) if self.in_text(e) else 0
+                            if not (self.in_text(v) and v & 3 == 0 and abs(v - a) < 0x10000):
+                                break
+                            bound += 1
+                        bound = bound or None
                     if bound is not None:
                         # layout: ldrls pc,[pc,rX,lsl#2]; b default; .word case0..caseN
                         stack.append(a + 4)
-                        for k2 in range(bound + 1):
+                        for k2 in range(bound + (1 if inclusive else 0)):
                             e = a + 8 + 4 * k2
                             if self.in_text(e):
                                 kind[self.idx(e)] = JT
@@ -268,6 +321,62 @@ class Tracer:
                 break
         return total
 
+    def gap_seeds(self, max_len=256):
+        """Seed untraced gaps that hold ARM code (see _code_run), at the gap start or
+        at an LR-saving prologue inside it. Code that nothing seeds (a function
+        after a return, reached only indirectly) would otherwise stay raw words
+        with position-dependent branches inside."""
+        import capstone
+
+        md = capstone.Cs(capstone.CS_ARCH_ARM, capstone.CS_MODE_ARM)
+        total = 0
+        for _ in range(8):
+            added = 0
+            i, n = 0, len(self.words)
+            while i < n:
+                if self.kind[i] or i in self.thumb:
+                    i += 1
+                    continue
+                j = i
+                while j < n and not self.kind[j] and j not in self.thumb:
+                    j += 1
+                # candidate starts: the gap start, and any LR-saving prologue inside it
+                starts = [i] + [x for x in range(i + 1, j)
+                                if self.words[x] & 0xFFFF4000 == 0xE92D4000 or self.words[x] == 0xE52DE004]
+                for c in starts:
+                    if self._code_run(c, j, md, max_len) and self.seed(self.base + 4 * c):
+                        added += 1
+                i = j
+            self.drain()
+            total += added
+            if not added:
+                break
+        return total
+
+    def _code_run(self, i, j, md, max_len):
+        """Words from index i decode as plausible ARM code up to an unconditional
+        return/branch: unconditional first instruction, no zero or small-number
+        words (top byte 0), no LDRD/STRD with an odd register, targets in .text."""
+        if self.words[i] >> 28 != AL:
+            return False
+        k = i
+        while k < j and k - i < max_len:
+            w = self.words[k]
+            a = self.base + 4 * k
+            if w >> 24 == 0 or next(md.disasm(struct.pack("<I", w), a), None) is None:
+                return False
+            if w & 0x0E1000D0 == 0x000000D0 and (w >> 12) & 1:  # LDRD/STRD (L=0, SH=1x) with odd Rt
+                return False
+            if any(not self.in_text(lt) for lt in pc_load_targets(w, a)):
+                return False
+            br = branch(w, a)
+            if br and not self.in_text(br[1] & ~1):
+                return False
+            if w >> 28 == AL and (writes_pc(w) == "ret" or (br and br[0] == "b")):
+                return True
+            k += 1
+        return False
+
     def runs(self, val):
         out, s = [], None
         n = len(self.words)
@@ -287,6 +396,7 @@ class Tracer:
             "code": self.runs(CODE),
             "literals": [self.base + 4 * i for i in range(n) if self.kind[i] == LIT],
             "jumptabs": [self.base + 4 * i for i in range(n) if self.kind[i] == JT],
+            "reltabs": {f"{a:#x}": c for a, c in sorted(self.reltabs.items())},
         }
 
     def summary(self):
@@ -295,6 +405,242 @@ class Tracer:
         th = len(self.thumb)
         return (f"words: {n}  code {counts[CODE] / n:.1%}  literal {counts[LIT] / n:.1%}  "
                 f"jumptable {counts[JT] / n:.1%}  thumb {th / n:.1%}  unknown {(counts[0] - th) / n:.1%}")
+
+
+def pointer_pairs(t, tr):
+    """Untraced words in .text holding function starts, next to another one or
+    right after a return (Mobiclip's per-format function-pointer pairs): they
+    become literals so they get symbols. UTF-16 look-alikes and round values
+    are left alone."""
+    from pointers import utf16_like
+    ok = lambda v: v in tr.funcs and not utf16_like(v) and v % 0x10000
+    found = []
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] or i in tr.thumb or not ok(w):
+            continue
+        a = tr.base + 4 * i
+        prev = tr.words[i - 1] if i else 0
+        nxt = tr.words[i + 1] if i + 1 < len(tr.words) else 0
+        if ok(prev) or ok(nxt) or (i and tr.kind[i - 1] == CODE and writes_pc(prev) == "ret"):
+            found.append(i)
+    for i in found:
+        tr.kind[i] = LIT
+    return len(found)
+
+
+def entry_stubs(t, tr):
+    """Code-module headers embedded in .text (the blending kernels): a link word
+    pointing at another header's entry, `b entry`, a size and a tag. An untraced
+    word pointing at an untraced unconditional `b` to a known function is such a
+    link: the `b` becomes code and the link a literal (so both get symbols)."""
+    found = 0
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] or i in tr.thumb or not tr.in_text(w) or w & 3:
+            continue
+        j = tr.idx(w)
+        if tr.kind[j] or j in tr.thumb:
+            continue
+        br = branch(tr.words[j], w)
+        if br and br[0] == "b" and tr.words[j] >> 28 == AL and br[1] in tr.funcs:
+            tr.seed(w)
+            tr.kind[i] = LIT
+            found += 1
+    tr.drain()
+    return found
+
+
+def relative_tables(t, tr):
+    """Tables of offsets from their own start, used as
+
+        adr   rB, table            (add/sub rB, pc, #imm)
+        ldr   rX, [rB, rI(, lsl #2)]
+        (offsets may be negative)
+        add   pc, rX, rB           (or add rY, ...; bx rY)
+
+    (armcc's blending kernels). Entries become JT words listed in
+    tr.reltabs {table: count}; their targets are traced as code."""
+    found = 0
+    while True:
+        new = []
+        for i, w in enumerate(tr.words):
+            if tr.kind[i] != CODE or i in tr.thumb:
+                continue
+            a = tr.base + 4 * i
+            if (w >> 25) & 7 != 1 or (w >> 16) & 0xF != 15 or (w >> 21) & 0xF not in (2, 4) or (w >> 20) & 1:
+                continue
+            rot, imm = ((w >> 8) & 0xF) * 2, w & 0xFF
+            v = ((imm >> rot) | (imm << (32 - rot))) & 0xFFFFFFFF if rot else imm
+            T = a + 8 + v if (w >> 21) & 0xF == 4 else a + 8 - v
+            rb = (w >> 12) & 0xF
+            if not tr.in_text(T) or T & 3 or T in tr.reltabs:
+                continue
+            ops = [tr.w(a + 4 * k) for k in range(1, 13) if tr.in_text(a + 4 * k)]
+            ldr = next((x for x in ops if (x >> 25) & 7 == 3 and (x >> 20) & 1 and not (x >> 22) & 1
+                        and (x >> 16) & 0xF == rb and not (x >> 4) & 1 and not (x >> 21) & 1), None)
+            if ldr is None:
+                continue
+            rx = (ldr >> 12) & 0xF
+            if not any((x >> 25) & 7 == 0 and (x >> 21) & 0xF == 4 and not (x >> 20) & 1 and (x >> 4) & 0xFF == 0
+                       and {(x >> 16) & 0xF, x & 0xF} == {rx, rb} for x in ops):
+                continue
+            n = 0
+            while n < 256 and tr.in_text(T + 4 * n) and tr.kind[tr.idx(T + 4 * n)] != CODE:
+                e = sext(tr.w(T + 4 * n), 32)
+                tgt = (T + e) & 0xFFFFFFFF
+                if not (0 < abs(e) < 0x100000 and tr.in_text(tgt) and not tgt & 3):
+                    break
+                n += 1
+            if n:
+                tr.reltabs[T] = n
+                for k in range(n):
+                    tr.kind[tr.idx(T + 4 * k)] = JT
+                    new.append((T + tr.w(T + 4 * k)) & 0xFFFFFFFF)
+        if not new:
+            return found
+        found += len(new)
+        for tgt in new:
+            if tr.kind[tr.idx(tgt)] != CODE:
+                tr.seed(tgt)
+        tr.drain()
+
+
+def carve_arm_from_thumb(t, tr, regions, pointers=()):
+    """ARM code inside the Thumb library regions (ARM-state entry stubs such as
+    `add ip, pc, #1; bx ip`, small ARM helpers): every ARM b/bl target, Thumb
+    BLX target and ARM push {..., lr} that lands in a Thumb region is ARM code. Trace each one
+    as ARM (the words it reaches stop being Thumb) and repeat until stable."""
+    carved = 0
+    while True:
+        entries = set()
+        for i, k in enumerate(tr.kind):
+            if k != CODE:
+                continue
+            a = t.base + 4 * i
+            br = branch(t.words[i], a)
+            if br and br[0] != "blx" and tr.idx(br[1]) in tr.thumb:
+                entries.add(br[1])
+        for v in pointers:
+            # an even pointer (vtable slot) into a Thumb region at an ARM `b` to a
+            # known function: a one-instruction ARM function (0x302CE0)
+            if tr.in_text(v) and not v & 3 and tr.idx(v) in tr.thumb:
+                br = branch(tr.w(v), v)
+                if br and br[0] == "b" and tr.w(v) >> 28 == AL and br[1] in tr.funcs:
+                    entries.add(v)
+        for i in tr.thumb:
+            # an ARM push {..., lr}: ARMv6 Thumb has no 32-bit instruction
+            # starting 0xE92D, so this is an ARM function nothing branches to
+            w = tr.words[i]
+            if w & 0xFFFF4000 == 0xE92D4000 or w == 0xE52DE004:
+                entries.add(t.base + 4 * i)
+        for i in sorted(tr.thumb):  # named regions and Thumb found since
+            for a in (t.base + 4 * i, t.base + 4 * i + 2):
+                if not tr.in_text(a + 2):
+                    continue
+                h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
+                c = thumb_call(h1, h2, a)
+                if c and c[0] == "blx" and tr.in_text(c[1]) and tr.idx(c[1]) in tr.thumb:
+                    entries.add(c[1])
+        if not entries:
+            return carved
+        for a in sorted(entries):
+            # linear ARM walk to find the words this entry covers
+            p = a
+            while tr.in_text(p) and tr.idx(p) in tr.thumb:
+                w = tr.w(p)
+                tr.thumb.discard(tr.idx(p))
+                for lt in pc_load_targets(w, p):
+                    tr.thumb.discard(tr.idx(lt))
+                if (writes_pc(w) == "ret" or (branch(w, p) and branch(w, p)[0] == "b")) and w >> 28 == AL:
+                    break
+                p += 4
+            tr.seed(a)
+            tr.seen.discard(a)  # it may have been reached before (and stopped at the Thumb boundary)
+            tr.work.append(a)
+            carved += 1
+        tr.drain()
+
+
+def thumb_from_blx(t, tr, pointers=()):
+    """Thumb functions outside the named Thumb regions, reached from ARM code by
+    BLX, by Thumb BL from Thumb code, or by an odd pointer (a vtable slot) to
+    code that opens like a Thumb function: mark the untraced gap each one sits in as Thumb (so the call and
+    the function get symbols), stopping at the next traced word."""
+    targets = []
+    for i, w in enumerate(tr.words):
+        if tr.kind[i] == CODE and i not in tr.thumb:
+            br = branch(w, tr.base + 4 * i)
+            if br and br[0] == "blx":
+                targets.append(br[1] & ~1)
+    for i in sorted(tr.thumb):  # Thumb BL from known Thumb code
+        for a in (tr.base + 4 * i, tr.base + 4 * i + 2):
+            if tr.in_text(a + 2):
+                h1, h2 = (struct.unpack_from("<H", t.blob, x - t.base)[0] for x in (a, a + 2))
+                c = thumb_call(h1, h2, a)
+                if c and c[0] == "bl":
+                    targets.append(c[1])
+    for v in pointers:
+        if v & 1 and tr.in_text(v & ~1) and tr.kind[tr.idx(v & ~3)] == 0:
+            h = struct.unpack_from("<H", t.blob, (v & ~1) - t.base)[0]
+            if h & 0xFF00 == 0xB500 or h == 0x4770:  # push {..., lr} / bx lr
+                targets.append(v & ~1)
+    found = 0
+    while targets:
+        new = []
+        for a in targets:
+            if not tr.in_text(a):
+                continue
+            j = tr.idx(a & ~3)
+            if j in tr.thumb or tr.kind[j]:
+                continue
+            found += 1
+            k = j
+            while k < len(tr.words) and not tr.kind[k] and k not in tr.thumb:
+                tr.thumb.add(k)
+                k += 1
+            # Thumb BL from the new code reaches more Thumb
+            s = tr.base + 4 * j
+            hw = struct.unpack_from(f"<{2 * (k - j)}H", t.blob, s - t.base)
+            for m in range(len(hw) - 1):
+                c = thumb_call(hw[m], hw[m + 1], s + 2 * m)
+                if c and c[0] == "bl":
+                    new.append(c[1])
+        targets = new
+    return found
+
+
+def thumb_gaps(t, tr):
+    """Unnamed Thumb functions between named ARM ones (static library code):
+    untraced gaps that open with a Thumb push and make a Thumb BL/BLX to a known
+    function or Thumb region. The whole gap becomes Thumb."""
+    known = lambda a: a in tr.funcs or (tr.in_text(a) and tr.idx(a & ~3) in tr.thumb)
+    found, i, n = 0, 0, len(tr.words)
+    while i < n:
+        if tr.kind[i] or i in tr.thumb:
+            i += 1
+            continue
+        j = i
+        while j < n and not tr.kind[j] and j not in tr.thumb:
+            j += 1
+        s = tr.base + 4 * i
+        hw = struct.unpack_from(f"<{2 * (j - i)}H", t.blob, s - t.base)
+        calls = [thumb_call(hw[k], hw[k + 1], s + 2 * k) for k in range(len(hw) - 1)]
+        if any(h & 0xFE00 == 0xB400 for h in hw[:4]) and any(c and known(c[1] & ~1) for c in calls):
+            tr.thumb.update(range(i, j))
+            found += 1
+        i = j
+    return found
+
+
+def thumb_runs(tr):
+    """Contiguous [start, end) runs of the remaining Thumb words."""
+    out = []
+    for i in sorted(tr.thumb):
+        a = tr.base + 4 * i
+        if out and out[-1][1] == a:
+            out[-1][1] = a + 4
+        else:
+            out.append([a, a + 4])
+    return out
 
 
 def analyze():
@@ -326,13 +672,20 @@ def analyze():
             tr.seed(a, name)
     named = len(tr.funcs)
     tr.drain()
+    carved = carve_arm_from_thumb(t, tr, thumb_regions)
     traced_seed = len(tr.funcs)
 
     # literal-pool / data pointers into text that look like code entry points
     lit_ptrs = tr.pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT)
     ro = t.blob[t.ro_off : t.ro_off + (t.ro[1] - t.ro[0]) // 4 * 4]
     da = t.blob[t.data_off : t.data_off + (t.data[1] - t.data[0]) // 4 * 4]
-    data_ptrs = tr.pointer_seeds(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
+    from pointers import utf16_like
+    dwords = struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)
+    # UTF-16 text ("40" = 0x00300034) is not a pointer: skip look-alikes with a
+    # look-alike neighbour, as pointers.classify does
+    data_ptrs = tr.pointer_seeds(v for k, v in enumerate(dwords)
+                                 if not (utf16_like(v) and ((k and utf16_like(dwords[k - 1]))
+                                                            or (k + 1 < len(dwords) and utf16_like(dwords[k + 1])))))
 
     # .init_array: armcc emits static-constructor tables as place-relative
     # offsets. Find long runs of rodata words where (address + word) is code.
@@ -347,13 +700,33 @@ def analyze():
             rel_targets.extend(run)
         run = []
     init_ptrs = tr.pointer_seeds(rel_targets)
-    prologue_seeds = tr.prologue_seeds()
+    prologue_seeds = gap_seeds = 0
+    while True:
+        prologue_seeds += tr.prologue_seeds()
+        gap_seeds += tr.gap_seeds()
+        prologue_seeds += tr.prologue_seeds()
+        # functions found since have literal pools of their own, pointing at
+        # more code (e.g. an entry scheduled before its push, reached only by address)
+        more = tr.pointer_seeds(t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT)
+        lit_ptrs += more
+        if not more:
+            break
+    reltab_targets = relative_tables(t, tr)
+    stubs = entry_stubs(t, tr)
+    stubs += pointer_pairs(t, tr)
+    blx_thumb = thumb_gaps(t, tr)
+    blx_thumb += thumb_from_blx(t, tr, [t.w(a) for a in range(t.base, t.end, 4) if tr.kind[tr.idx(a)] == LIT]
+                               + list(struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da)))
+    carved += carve_arm_from_thumb(t, tr, thumb_regions,  # code found since may branch into Thumb too
+                                   struct.unpack(f"<{len(ro) // 4}I", ro) + struct.unpack(f"<{len(da) // 4}I", da))
 
     result = tr.result()
-    result["thumb"] = thumb_regions
+    result["thumb"] = thumb_runs(tr)
     json.dump(result, open(os.path.join(ROOT, "analysis.json"), "w"))
+    print(f"carved {carved} ARM entry points out of Thumb regions; {blx_thumb} Thumb functions from ARM blx / odd pointers")
     print(f"functions: {len(tr.funcs)} ({named} named; {traced_seed - named} from calls, "
-          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues)")
+          f"{lit_ptrs} literal ptrs, {data_ptrs} data ptrs, {init_ptrs} init_array, {prologue_seeds} prologues, {gap_seeds} code gaps); "
+          f"{len(tr.reltabs)} relative tables ({reltab_targets} entries), {stubs} module entry stubs / pointer pairs")
     print("text " + tr.summary())
 
 

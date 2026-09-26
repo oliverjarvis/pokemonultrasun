@@ -26,9 +26,26 @@ def read(path):
         return f.read()
 
 
+def code_set_info(exheader, elf_path):
+    """Exheader with text/rodata/data address, page count and size, and the
+    .bss size, taken from the linked code.bin."""
+    from elftools.elf.elffile import ELFFile
+
+    ex = bytearray(exheader)
+    with open(elf_path, "rb") as fh:
+        elf = ELFFile(fh)
+        for name, off in ((".text", 0x10), (".rodata", 0x20), (".data", 0x30)):
+            sec = elf.get_section_by_name(name)
+            size = sec["sh_size"]
+            struct.pack_into("<III", ex, off, sec["sh_addr"], (size + 0xFFF) // 0x1000, size)
+        struct.pack_into("<I", ex, 0x3C, elf.get_section_by_name(".bss")["sh_size"])
+    return bytes(ex)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--code", default="build/code.bin")
+    ap.add_argument("--elf", help="linked code.bin ELF: update the exheader's code set info from it")
     ap.add_argument("--romfs", default="build/romfs.bin")
     ap.add_argument("--parts", default="orig/rom")
     ap.add_argument("--out", default="build/rom.3ds")
@@ -44,8 +61,11 @@ def main():
     # NCCH
     romfs_size = os.path.getsize(args.romfs)
     hash_size, romfs_hash = romfs_hash_region(args.romfs)
+    exheader = read(p("ncch", "exheader.bin"))
+    if args.elf:
+        exheader = code_set_info(exheader, args.elf)
     ncch_hdr, ncch_parts, ncch_size = ncch_layout(
-        read(p("ncch", "header.bin")), read(p("ncch", "exheader.bin")), read(p("ncch", "logo.bin")),
+        read(p("ncch", "header.bin")), exheader, read(p("ncch", "logo.bin")),
         read(p("ncch", "plain.bin")), exefs, romfs_size, hash_size, romfs_hash)
 
     # NCSD
@@ -70,7 +90,9 @@ def main():
     card[0x1100:0x1200] = ncch_hdr[0x100:0x200]
     card[0x1188:0x1190] = flags
 
-    with open(args.out, "wb") as o:
+    # write beside the target and swap it in: an emulator may be running the old ROM
+    tmp = args.out + ".tmp"
+    with open(tmp, "wb") as o:
         o.write(card)
         base = placed[0][0]
         o.write(ncch_hdr)
@@ -93,6 +115,7 @@ def main():
                 o.write(chunk[: min(left, len(chunk))])
                 left -= min(left, len(chunk))
         o.truncate(filled if args.trim else capacity)
+    os.replace(tmp, args.out)
     print(f"wrote {args.out}: NCCH {ncch_size:#x}, {len(extra)} extra partitions, "
           f"{'trimmed at' if args.trim else 'filled to'} {filled if args.trim else capacity:#x}")
 
