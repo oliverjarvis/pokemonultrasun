@@ -42,7 +42,7 @@ def check_modules():
     if not os.path.isdir(built_dir):
         return None
     orig_dir = os.path.join(ROOT, "orig", "rom", "romfs")
-    paths = sorted(f for f in os.listdir(built_dir) if f.endswith(".cro")) + [os.path.join(".crr", "static.crr")]
+    paths = sorted(f for f in os.listdir(built_dir) if f.endswith(".cro")) + ["static.crs", os.path.join(".crr", "static.crr")]
     bad = []
     for rel in paths:
         a, b = os.path.join(built_dir, rel), os.path.join(orig_dir, rel)

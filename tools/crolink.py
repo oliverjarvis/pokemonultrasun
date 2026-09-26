@@ -3,6 +3,10 @@
 
   crolink.py ORIG.cro MODULE.elf META.json OUT.cro
 
+Anonymous imports (raw offsets into another module) are re-resolved from the
+target module's linked ELF via build/cro/<Target>/incoming.json, so they stay
+correct when the target module changes size.
+
 The ELF comes from linking the module's asm/C++ with its layout.ld (each
 segment at its own base, see cro_split.SEG_BASE) and `ld.lld --emit-relocs`.
 Every absolute relocation becomes a CRO relocation and its word is zeroed:
@@ -27,7 +31,37 @@ from elftools.elf.elffile import ELFFile
 from elftools.elf.relocation import RelocationSection
 
 from cro import TABLES, Cro, u32
-from cro_split import SEG_BASE, SEGMENT_NAMES
+from cro_split import ROMFS, SEG_BASE, SEGMENT_NAMES, segments_by_kind
+
+TARGETS = "build/cro"
+
+
+def elf_symbols(path):
+    with open(path, "rb") as fh:
+        return {s.name: s["st_value"] for s in ELFFile(fh).get_section_by_name(".symtab").iter_symbols() if s.name}
+
+
+_targets = {}
+
+
+def target_tag(module, tag):
+    """New segment tag for an anonymous import of `tag` in `module`."""
+    if module not in _targets:
+        import os
+        incoming = json.load(open(os.path.join(TARGETS, module, "incoming.json")))
+        syms = elf_symbols(os.path.join(TARGETS, module, "module.elf"))
+        seg_index = {k: v[0] for k, v in segments_by_kind(
+            Cro(open(os.path.join(ROMFS, module + ".cro"), "rb").read(), module)).items()}
+        _targets[module] = (incoming, syms, seg_index)
+    incoming, syms, seg_index = _targets[module]
+    sym = incoming.get(f"{tag:#x}")
+    if sym is None or sym not in syms:
+        sys.exit(f"anonymous import {module}:{tag:#x}: no symbol in the target module")
+    v = syms[sym]
+    kind = KIND_OF_BASE[v >> 28]
+    if kind == "text":
+        v &= ~1
+    return ((v - SEG_BASE[kind]) << 4) | seg_index[kind]
 
 ABS_TYPES = {2, 38}  # R_ARM_ABS32, R_ARM_TARGET1
 KIND_OF_BASE = {v >> 28: k for k, v in SEG_BASE.items()}
@@ -227,7 +261,8 @@ def main():
         orig_name_off = u32(orig.table("named_imports")[i], 0)
         struct.pack_into("<II", out, t["named_imports"] + 8 * i, t["import_strings"] + orig_name_off - istr, head[imp["sym"]])
     for i, imp in enumerate(anon):
-        struct.pack_into("<II", out, t["anon_imports"] + 8 * i, imp["tag"], head[imp["sym"]])
+        struct.pack_into("<II", out, t["anon_imports"] + 8 * i, target_tag(imp["module"], imp["tag"]),
+                         head[imp["sym"]])
     for i, (e, m) in enumerate(zip(orig.table("import_modules"), meta["import_modules"])):
         name_ptr, ihead, inum, ahead, anum = struct.unpack("<5I", e)
         struct.pack_into("<5I", out, t["import_modules"] + 20 * i, t["import_strings"] + name_ptr - istr,
